@@ -1,0 +1,31 @@
+# 运行产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 规约§1：临时下载目录，用后即清
+tmp/
+
+# 本地敏感配置兜底（正常应存于 ~/.WisePet/，禁止入库）
+.WisePet/
+config.local.json
+
+# 测试与覆盖率产物
+.pytest_cache/
+.coverage
+htmlcov/
+cover/
+
+# 日志
+logs/
+
+assets-bak/

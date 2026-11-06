@@ -1,0 +1,23 @@
+[project]
+name = "WisePet"
+version = "0.1.0"
+description = "跨平台桌面宠物：序列帧动画 + 行为状态机 + AI 流式聊天 + 状态心情 + 提醒陪伴"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# TDD 规约：测试命名 should_[行为]_when_[条件]，需同时收集 test_* 与 should_*
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*", "should_*"]
+
+[tool.coverage.run]
+source = ["src/WisePet"]
+# ui 层由 tests/ui 冒烟覆盖，offscreen 环境下不纳入覆盖率门槛
+omit = ["*/WisePet/ui/*"]
+
+[tool.coverage.report]
+# 实测：domain 100% / app 99% / infra 99%（合计 98.31%，330 项测试）
+# 门槛取 90%，远高于规约底线（domain ≥80%、app ≥70%），留出平台专属分支波动余量
+fail_under = 90
+show_missing = true

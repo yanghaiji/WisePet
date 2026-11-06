@@ -1,0 +1,7 @@
+-r requirements.txt
+pytest>=8.0
+pytest-qt>=4.4
+respx>=0.21
+pytest-cov>=5.0
+# 打包程序 tools/package.py 的构建期依赖（运行期不需要）
+pyinstaller>=6.0,<7
