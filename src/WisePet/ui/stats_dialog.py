@@ -14,6 +14,7 @@ QLabel#statsTitle { color: #5A3E28; font-size: 15px; font-weight: 600; }
 QLabel#statsDot { color: #E8A45C; font-size: 16px; }
 QLabel#statValue { color: #E8A45C; font-size: 26px; font-weight: 700; }
 QLabel#statLabel { color: #9A7A55; font-size: 11px; }
+QLabel#statsGrowth { color: #6B4F3A; font-size: 13px; font-weight: 600; }
 QLabel#statsFoot { color: #B09A7C; font-size: 10px; }
 QPushButton#close {
     background: transparent; border: none; color: #A08A6C;
@@ -86,17 +87,31 @@ class StatsDialog(QWidget):
         grid_holder.setLayout(grid)
         body.addWidget(grid_holder)
 
+        self._growth = QLabel("成长：–", card)
+        self._growth.setObjectName("statsGrowth")
+        self._growth.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        growth_holder = QWidget(card)
+        growth_row = QHBoxLayout(growth_holder)
+        growth_row.setContentsMargins(18, 2, 18, 2)
+        growth_row.addWidget(self._growth)
+        body.addWidget(growth_holder)
+
         foot = QLabel("数据全部保存在本机 ~/.WisePet/，绝不上传", card)
         foot.setObjectName("statsFoot")
         foot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         body.addWidget(foot)
 
     def set_values(self, *, days: int, messages: int,
-                   focus_minutes: float, focus_count: int) -> None:
+                   focus_minutes: float, focus_count: int,
+                   level: int | None = None, stage: str = "") -> None:
         self._values["days"].setText(str(days))
         self._values["messages"].setText(str(messages))
         self._values["focus_min"].setText(f"{focus_minutes:.0f}")
         self._values["focus_count"].setText(str(focus_count))
+        if level is not None:
+            self._growth.setText(f"成长：Lv{level}" + (f" · {stage}" if stage else ""))
+        else:
+            self._growth.setText("成长：–")
 
     def show_centered(self) -> None:
         self.adjustSize()

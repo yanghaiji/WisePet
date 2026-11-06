@@ -147,6 +147,38 @@ def should_roundtrip_chat_idle_hide_seconds(qtbot, base_config):
     assert cfg.chat.idle_hide_s == 15.0
 
 
+def should_roundtrip_companion_features_when_edited(qtbot, base_config):
+    """v2.2 四项（语音/系统通知/周报/成长）：默认回填 + 改后 collect 取回。"""
+    dialog = SettingsDialog(base_config)
+    qtbot.addWidget(dialog)
+
+    # 默认值回填
+    assert dialog._tts_enabled.isChecked() is False
+    assert dialog._tts_volume.value() == 100
+    assert dialog._notify_system.isChecked() is False
+    assert dialog._weekly_enabled.isChecked() is True
+    assert dialog._weekly_weekday.currentData() == 6
+    assert dialog._growth_enabled.isChecked() is True
+
+    dialog._tts_enabled.setChecked(True)
+    dialog._tts_volume.setValue(60)
+    dialog._tts_rate.setValue(-3)
+    dialog._notify_system.setChecked(True)
+    dialog._weekly_weekday.setCurrentIndex(0)   # 周一
+    dialog._weekly_hour.setValue(9)
+    dialog._growth_enabled.setChecked(False)
+
+    cfg, error = dialog.collect()
+
+    assert error == ""
+    assert cfg.tts.enabled is True and cfg.tts.volume == 60 and cfg.tts.rate == -3
+    assert cfg.notification.use_system is True
+    assert cfg.weekly.enabled is True and cfg.weekly.weekday == 0 and cfg.weekly.hour == 9
+    assert cfg.growth.enabled is False
+    # 未动字段不被重置
+    assert cfg.bubble.duration_s == base_config.bubble.duration_s
+
+
 def should_reject_when_idle_min_exceeds_max(qtbot, base_config):
     dialog = SettingsDialog(base_config)
     qtbot.addWidget(dialog)
@@ -276,12 +308,12 @@ class TestStickerStyle:
 
         assert not dialog.isVisible()
 
-    def should_keep_four_sections_in_scrollable_card(self, qtbot, base_config):
+    def should_keep_five_sections_in_scrollable_card(self, qtbot, base_config):
         dialog = SettingsDialog(base_config)
         qtbot.addWidget(dialog)
 
         assert dialog._scroll.widgetResizable()
-        assert len(dialog.findChildren(QFrame, "section")) == 4
+        assert len(dialog.findChildren(QFrame, "section")) == 5
 
     def should_use_same_palette_for_buttons_and_status(self, qtbot, base_config):
         dialog = SettingsDialog(base_config)

@@ -116,6 +116,34 @@ class ChatSettings:
 
 
 @dataclass
+class TtsSettings:
+    """语音说话：提醒/回复可开口朗读（本地 TTS，Windows+macOS，零上传）。"""
+    enabled: bool = False
+    volume: int = 100      # 0~100 音量
+    rate: int = 0          # -10~10 语速（慢→快），macOS 折算为 speaking rate
+
+
+@dataclass
+class NotificationSettings:
+    """通知呈现方式：自绘气泡（陪伴感）或接入系统通知中心（降打扰）。"""
+    use_system: bool = False
+
+
+@dataclass
+class WeeklySettings:
+    """回忆录：每周指定日基于本地聊天记录生成并推送周报（全本地数据）。"""
+    enabled: bool = True
+    weekday: int = 6       # 0=周一 … 6=周日，默认周日推送
+    hour: int = 20         # 推送时刻（本地小时，0~23）
+
+
+@dataclass
+class GrowthSettings:
+    """成长体系：喂食/抚摸/陪伴互动积累 → 等级与形态（幼年→成长→成熟）。"""
+    enabled: bool = True
+
+
+@dataclass
 class FocusSettings:
     """番茄钟：默认专注时长，一句话（「来个番茄钟」）与右键菜单都取这个值。"""
     default_min: float = 25.0
@@ -151,6 +179,10 @@ class AppConfig:
     chat: ChatSettings = field(default_factory=ChatSettings)
     focus: FocusSettings = field(default_factory=FocusSettings)
     dnd: DndSettings = field(default_factory=DndSettings)
+    tts: TtsSettings = field(default_factory=TtsSettings)
+    notification: NotificationSettings = field(default_factory=NotificationSettings)
+    weekly: WeeklySettings = field(default_factory=WeeklySettings)
+    growth: GrowthSettings = field(default_factory=GrowthSettings)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -263,9 +295,30 @@ class AppConfig:
             start_hour=int(_num(d_d.get("start_hour"), defaults.dnd.start_hour)) % 24,
             end_hour=int(_num(d_d.get("end_hour"), defaults.dnd.end_hour)) % 24,
         )
+        t_d = data.get("tts") or {}
+        tts = TtsSettings(
+            enabled=_bool(t_d.get("enabled"), defaults.tts.enabled),
+            volume=_int_clamp(t_d.get("volume"), defaults.tts.volume, 0, 100),
+            rate=_int_clamp(t_d.get("rate"), defaults.tts.rate, -10, 10),
+        )
+        nt_d = data.get("notification") or {}
+        notification = NotificationSettings(
+            use_system=_bool(nt_d.get("use_system"), defaults.notification.use_system),
+        )
+        w_d = data.get("weekly") or {}
+        weekly = WeeklySettings(
+            enabled=_bool(w_d.get("enabled"), defaults.weekly.enabled),
+            weekday=int(_num(w_d.get("weekday"), defaults.weekly.weekday)) % 7,
+            hour=int(_num(w_d.get("hour"), defaults.weekly.hour)) % 24,
+        )
+        g_d = data.get("growth") or {}
+        growth = GrowthSettings(
+            enabled=_bool(g_d.get("enabled"), defaults.growth.enabled),
+        )
         return cls(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                    vitals=vitals, reminders=reminders, news=news, cheer=cheer,
-                   bubble=bubble, chat=chat, focus=focus, dnd=dnd)
+                   bubble=bubble, chat=chat, focus=focus, dnd=dnd,
+                   tts=tts, notification=notification, weekly=weekly, growth=growth)
 
 
 def _parse_profiles(raw, ai: AIConfig) -> list:
@@ -306,3 +359,8 @@ def _prob(raw, fallback: float) -> float:
 def _bool(raw, fallback: bool) -> bool:
     """布尔配置：缺键/空值回默认，不把 null 当成 False。"""
     return fallback if raw is None else bool(raw)
+
+
+def _int_clamp(raw, fallback: int, lo: int, hi: int) -> int:
+    """整数配置：非法值回默认，越界钳到 [lo, hi]（手改 json 写超范围也不会失控）。"""
+    return min(hi, max(lo, int(_num(raw, fallback))))

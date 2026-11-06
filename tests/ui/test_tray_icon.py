@@ -60,3 +60,24 @@ def should_ignore_right_click_when_icon_activated(qapp):
 
 def should_report_platform_support_when_asked():
     assert isinstance(PetTrayIcon.is_available(), bool)
+
+
+def should_show_notification_via_system_when_tray_available(qapp, monkeypatch):
+    """系统通知中心旁路（v2.0）：托盘可用时走 showMessage，返回 True 供上层跳过气泡。"""
+    tray, _ = _icon(qapp)
+    shown = []
+    monkeypatch.setattr(tray, "isSystemTrayAvailable", lambda: True, raising=False)
+    monkeypatch.setattr(tray, "showMessage", lambda *a, **k: shown.append(a), raising=False)
+
+    ok = tray.show_notification("提醒", "该喝水啦", msec=5000)
+
+    assert ok is True
+    assert shown and shown[0][0] == "提醒" and shown[0][1] == "该喝水啦"
+
+
+def should_decline_notification_when_tray_unavailable(qapp, monkeypatch):
+    """托盘不可用时返回 False，调用方据此回退自绘气泡（通知必达）。"""
+    tray, _ = _icon(qapp)
+    monkeypatch.setattr(tray, "isSystemTrayAvailable", lambda: False, raising=False)
+
+    assert tray.show_notification("提醒", "正文") is False

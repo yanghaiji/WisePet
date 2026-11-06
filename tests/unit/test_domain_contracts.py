@@ -66,3 +66,41 @@ class TestConfigParsing:
         assert AppConfig.from_dict({"chat": {"idle_hide_s": 10}}).chat.idle_hide_s == 10.0
         assert AppConfig.from_dict({"chat": {"idle_hide_s": -5}}).chat.idle_hide_s == 0.0
         assert AppConfig.from_dict({"chat": {"idle_hide_s": "x"}}).chat.idle_hide_s == 30.0
+
+    def should_default_companion_sections(self):
+        """v2.2 四节默认值：TTS 关、系统通知关、周报开（周日 20 点）、成长开。"""
+        cfg = AppConfig()
+        assert (cfg.tts.enabled, cfg.tts.volume, cfg.tts.rate) == (False, 100, 0)
+        assert cfg.notification.use_system is False
+        assert (cfg.weekly.enabled, cfg.weekly.weekday, cfg.weekly.hour) == (True, 6, 20)
+        assert cfg.growth.enabled is True
+
+    def should_override_and_clamp_companion_sections(self):
+        """json 覆盖 + 越界钳制 + 非法回默认（音量 0~100、语速 -10~10、周/时取模）。"""
+        cfg = AppConfig.from_dict({
+            "tts": {"enabled": True, "volume": 150, "rate": -99},
+            "notification": {"use_system": True},
+            "weekly": {"enabled": False, "weekday": 9, "hour": 30},
+            "growth": {"enabled": False},
+        })
+        assert cfg.tts.enabled is True
+        assert cfg.tts.volume == 100          # 150 钳到上限
+        assert cfg.tts.rate == -10            # -99 钳到下限
+        assert cfg.notification.use_system is True
+        assert cfg.weekly.enabled is False
+        assert cfg.weekly.weekday == 2        # 9 % 7
+        assert cfg.weekly.hour == 6           # 30 % 24
+        assert cfg.growth.enabled is False
+
+    def should_fall_back_when_companion_numbers_unparsable(self):
+        defaults = AppConfig()
+        cfg = AppConfig.from_dict({"tts": {"volume": "loud", "rate": None},
+                                   "weekly": {"weekday": "x"}})
+        assert cfg.tts.volume == defaults.tts.volume
+        assert cfg.tts.rate == defaults.tts.rate
+        assert cfg.weekly.weekday == defaults.weekly.weekday
+
+    def should_roundtrip_companion_sections_via_to_dict(self):
+        cfg = AppConfig.from_dict({"tts": {"enabled": True, "volume": 40}})
+        again = AppConfig.from_dict(cfg.to_dict())
+        assert again.tts.enabled is True and again.tts.volume == 40

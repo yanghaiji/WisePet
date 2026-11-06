@@ -15,6 +15,8 @@ TOOLTIP_VISIBLE = "WisePet · 右键菜单可操作，双击图标隐藏"
 TOOLTIP_HIDDEN = "WisePet（已隐藏）· 点托盘图标或「显示宠物」找回"
 #: 托盘不可用时不能再让用户把唯一入口藏掉
 HIDE_DISABLED_HINT = "当前系统没有可用托盘，禁用隐藏以免找不到宠物"
+#: 系统通知默认驻留（毫秒）；QSystemTrayIcon 上限普遍约 10s
+NOTIFY_DEFAULT_MS = 8_000
 
 
 class PetTrayIcon(QSystemTrayIcon):
@@ -34,6 +36,16 @@ class PetTrayIcon(QSystemTrayIcon):
     def is_available() -> bool:
         """平台是否真的提供系统托盘（offscreen 下为 False，用于降级判定）。"""
         return QSystemTrayIcon.isSystemTrayAvailable()
+
+    def show_notification(self, title: str, body: str, *, msec: int = NOTIFY_DEFAULT_MS) -> bool:
+        """接入系统通知中心（Windows 动作中心 / macOS 通知中心），降打扰可选。
+
+        托盘不可用时返回 False，调用方据此回退自绘气泡（保证通知必达）。
+        """
+        if not self.isSystemTrayAvailable():
+            return False
+        self.showMessage(str(title or ""), str(body or ""), self.icon(), max(1_000, int(msec)))
+        return True
 
     def set_hidden_state(self, hidden: bool) -> None:
         self.setToolTip(TOOLTIP_HIDDEN if hidden else TOOLTIP_VISIBLE)

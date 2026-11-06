@@ -56,11 +56,14 @@ from WisePet.app.chat_history import ChatHistory                        # noqa: 
 from WisePet.app.chat_service import ChatService                       # noqa: E402
 from WisePet.app.event_bus import EventBus                              # noqa: E402
 from WisePet.app.focus_service import FocusLog, FocusService           # noqa: E402
+from WisePet.app.growth_service import GrowthService                    # noqa: E402
 from WisePet.app.local_responder import LocalContext, LocalResponder    # noqa: E402
 from WisePet.app.news_service import NewsService                       # noqa: E402
 from WisePet.app.one_shot_reminders import OneShotReminders             # noqa: E402
 from WisePet.app.pet_controller import PetController                   # noqa: E402
 from WisePet.app.reminder_service import ReminderService               # noqa: E402
+from WisePet.app.tts_announcer import TtsAnnouncer                      # noqa: E402
+from WisePet.app.weekly_report import WeeklyReportService              # noqa: E402
 from WisePet.domain.chat_record import day_key                          # noqa: E402
 from WisePet.domain.chat_session import ChatSession                    # noqa: E402
 from WisePet.domain.events import (                                    # noqa: E402
@@ -89,10 +92,13 @@ from WisePet.infra.config_repo import (                               # noqa: E4
     JsonConfigRepository, migrate_legacy_data)
 from WisePet.infra.frame_loader import FrameAssetLoader                # noqa: E402
 from WisePet.infra.global_hotkey import GlobalHotKey                   # noqa: E402
+from WisePet.infra.growth_store import GrowthStore                     # noqa: E402
 from WisePet.infra.instance_guard import InstanceGuard                 # noqa: E402
 from WisePet.infra.logger_setup import setup_logging                   # noqa: E402
 from WisePet.infra.news_feed import fetch_headlines                    # noqa: E402
 from WisePet.infra.reminder_store import ReminderStore                 # noqa: E402
+from WisePet.infra.tts import create_synthesizer                       # noqa: E402
+from WisePet.infra.weekly_store import WeeklyStore                     # noqa: E402
 from WisePet.infra.openai_client import OpenAICompatClient             # noqa: E402
 from WisePet.infra.ppt_builder import build_ppt                        # noqa: E402
 from WisePet.infra.pet_state_repo import PetStateRepository            # noqa: E402
@@ -196,6 +202,18 @@ class PetApplication:
         self._focus = FocusService(
             clock=self._clock, bus=self._bus,
             append_entry=self._append_focus_entry)
+        # v2.2 陪伴进阶：成长体系 / 每周回忆录 / 本地语音（TTS）
+        self._growth = GrowthService(
+            clock=self._clock, bus=self._bus,
+            store=GrowthStore(self._config_repo.path.parent),
+            config_provider=lambda: self._config)
+        self._weekly = WeeklyReportService(
+            clock=self._clock, bus=self._bus, config_provider=lambda: self._config,
+            records_provider=lambda: self._chat_history.recent_turns(7),
+            store=WeeklyStore(self._config_repo.path.parent),
+            summarizer=self._summarize_week, deferral_provider=self._quiet_deferral)
+        self._tts = TtsAnnouncer(create_synthesizer(enabled=True),
+                                 lambda: self._config)
 
         self._animator = FrameAnimator(FrameAssetLoader(self._assets_dir,
                                                         self._config.pet.skin),
@@ -211,8 +229,8 @@ class PetApplication:
             days_provider=self._chat_history.days,
             records_provider=self._chat_history.records_for)
         self._menu = PetMenu(on_settings=self.open_settings,
-                             on_feed=self._controller.feed,
-                             on_pet_head=self._controller.pet_head,
+                             on_feed=self._on_feed,
+                             on_pet_head=self._on_pet_head,
                              on_toggle_visible=self.toggle_visible,
                              on_quit=self._app.quit,
                              on_reload=self.reload_assets,
@@ -255,6 +273,7 @@ class PetApplication:
         self._set_chat_state(PHASE_IDLE, self._brain_source())
         self._news.start()
         self._cheer.start()
+        self._weekly.start()
         self._hotkey = GlobalHotKey(
             callback=lambda: self._bus.publish(HotkeyChatRequestedEvent()))
         self._hotkey.start()
@@ -298,6 +317,8 @@ class PetApplication:
         self._news.tick(now)
         self._cheer.tick(now)
         self._focus.tick(now)
+        self._weekly.tick(now)
+        self._growth.tick(now)
         self._sync_window()
         self._sync_motion_timer()
         if self._clock.monotonic() - self._last_save_at >= self._config.vitals.save_interval_s:
@@ -516,6 +537,7 @@ class PetApplication:
         if not self._chat.send(text, attachments):
             logger.debug("blank message dropped")
             return
+        self._growth.on_chat()   # 真实聊天消息计入成长积分
         self._controller.start_thinking()
         self._sync_window()
         self._streaming = True
@@ -562,6 +584,16 @@ class PetApplication:
             f"好，陪你专注 {minutes:.0f} 分钟，这段时间好好干活，到点我叫你休息～",
             source="system")
 
+    def _on_feed(self) -> None:
+        """喂饱：宠物进食动画 + 成长积分（喂食是主要的“照护”行为）。"""
+        self._controller.feed()
+        self._growth.on_feed()
+
+    def _on_pet_head(self) -> None:
+        """抚摸：提升心情 + 成长积分。"""
+        self._controller.pet_head()
+        self._growth.on_pet()
+
     def _append_focus_entry(self, entry: dict) -> None:
         path = self._config_repo.path.parent / "focus.json"
         entries = []
@@ -589,8 +621,10 @@ class PetApplication:
         messages = sum(len(self._chat_history.records_for(day)) for day in days)
         entries = self._load_focus_entries()
         minutes, count = FocusLog.summarize(entries, day_key())
+        growth = self._growth.current()
         self._stats_dialog.set_values(days=len(days), messages=messages,
-                                      focus_minutes=minutes, focus_count=count)
+                                      focus_minutes=minutes, focus_count=count,
+                                      level=growth.level, stage=growth.stage)
         self._stats_dialog.show_centered()
 
     def _screenshot_ask(self) -> None:
@@ -644,6 +678,10 @@ class PetApplication:
         with_ack = event.source == "reminder"
         if not with_ack:
             self._controller.start_speaking()
+        self._tts.announce(event.text)   # 开了语音就开口朗读（未开为 no-op）
+        if self._notify_via_system(event):
+            self._sync_window()
+            return
         self._bubble.show_text(
             event.text, source=event.source, title=event.title,
             anchor=self._window.bubble_anchor(),
@@ -651,6 +689,18 @@ class PetApplication:
             on_ack=(self._ack_reminder if with_ack else None),
             on_close=self._controller.on_action_finished)
         self._sync_window()
+
+    def _notify_via_system(self, event: SpeakRequestedEvent) -> bool:
+        """系统通知中心旁路：开了 use_system 且托盘可用时走系统通知，返回 True。
+
+        否则返回 False 回退自绘气泡（保证通知必达）。提醒类进系统通知后
+        不再携带「知道啦」确认（确认语义由下次间隔重排兼顾）。
+        """
+        if not getattr(self._config.notification, "use_system", False):
+            return False
+        title = event.title or "WisePet"
+        msec = int(max(3.0, float(self._config.bubble.duration_s)) * 1000)
+        return self._tray.show_notification(title, event.text, msec=msec)
 
     def _on_chunk(self, event: ChatReplyChunkEvent) -> None:
         if event.done:
@@ -660,6 +710,7 @@ class PetApplication:
                 self._handle_action(action)   # 模型返回的是操作指令，不当文本展示
                 return
             self._controller.start_speaking()
+            self._tts.announce(event.reply)
             self._bubble.end_stream(event.reply, anchor=self._window.bubble_anchor(),
                                     on_close=self._controller.on_action_finished)
             self._sync_window()
@@ -757,6 +808,24 @@ class PetApplication:
             return self._ai_client.complete([{"role": "user", "content": prompt}], ai)
         except AIGatewayError as exc:
             logger.warning("news summarize failed [%s]: %s", exc.kind, exc.detail)
+            return None
+
+    def _summarize_week(self, stats: dict) -> str | None:
+        """本周统计 → AI 润色成宠物口吻的周报；未配 Key 或失败返回 None（走本地模板）。"""
+        ai = self._config.ai
+        if not ai.configured:
+            return None
+        facts = [f"本周我们聊了 {stats.get('messages', 0)} 句",
+                 f"有 {stats.get('active_days', 0)} 天你在"]
+        if stats.get("top_topic"):
+            facts.append(f"你问得最多的是「{stats['top_topic']}」")
+        prompt = (f"你是桌面宠物「{self._pet.name}」。根据本周陪伴数据写成一段"
+                  f"不超过80字、温暖口语化的中文周报，直接输出正文，不要解释：\n"
+                  + "，".join(facts))
+        try:
+            return self._ai_client.complete([{"role": "user", "content": prompt}], ai)
+        except AIGatewayError as exc:
+            logger.warning("weekly summarize failed [%s]: %s", exc.kind, exc.detail)
             return None
 
     def _on_chat_error(self, event: ChatErrorEvent) -> None:

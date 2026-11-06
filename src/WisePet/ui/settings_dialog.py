@@ -280,8 +280,8 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("WisePet 设置")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setMinimumSize(460, 460)
-        self.resize(520, 600)
+        self.setMinimumSize(560, 460)
+        self.resize(640, 600)
         self.setStyleSheet(_STYLE)
 
         card = QFrame(self)
@@ -326,6 +326,7 @@ class SettingsDialog(QDialog):
         body.addWidget(self._build_persona_group(content))
         body.addWidget(self._build_pet_group(content))
         body.addWidget(self._build_reminder_group(content))
+        body.addWidget(self._build_companion_group(content))
         body.addStretch(1)
         self._scroll.setWidget(content)
 
@@ -367,8 +368,9 @@ class SettingsDialog(QDialog):
         value_widgets = (self._temperature, self._timeout, self._walk_speed,
                          self._idle_min, self._idle_max, self._max_turns,
                          self._chat_idle_hide,
+                         self._tts_volume, self._tts_rate, self._weekly_hour,
                          self._water_interval, self._sedentary_interval)
-        for widget in value_widgets + (self._skin,):
+        for widget in value_widgets + (self._skin, self._weekly_weekday):
             widget.wheel_target = self._scroll.viewport()
         for widget in value_widgets:
             # 上一轮把滚轮改成「只滚页面」、微调按钮又做成透明，用户以为没法输入。
@@ -615,6 +617,35 @@ class SettingsDialog(QDialog):
         form.addRow("久坐间隔", self._sedentary_interval)
         return box
 
+    def _build_companion_group(self, parent: QWidget) -> QFrame:
+        """v2.2 陪伴进阶：语音说话 / 系统通知中心 / 每周回忆录 / 成长体系。"""
+        box, form = self._section(parent, "陪伴进阶")
+        self._tts_enabled = QCheckBox("语音说话（本地 TTS，提醒/回复可开口朗读）", box)
+        self._tts_volume = _int_spin(0, 100, 100, " %", box)
+        self._tts_volume.setToolTip("朗读音量 0~100（Windows 生效；macOS 走系统音量）")
+        self._tts_rate = _int_spin(-10, 10, 0, "", box)
+        self._tts_rate.setToolTip("语速 -10（慢）~ 10（快），0 为正常")
+        form.addRow("语音说话", self._tts_enabled)
+        form.addRow("朗读音量", self._tts_volume)
+        form.addRow("语速", self._tts_rate)
+        self._notify_system = QCheckBox(
+            "通知走系统通知中心（关闭则用宠物头顶气泡）", box)
+        self._notify_system.setToolTip(
+            "开启后提醒等通知进 Windows 动作中心 / macOS 通知中心，降低打扰；托盘不可用时自动回退气泡")
+        form.addRow("系统通知", self._notify_system)
+        self._weekly_enabled = QCheckBox("每周回忆录（基于本地聊天生成周报）", box)
+        self._weekly_weekday = _NoWheelComboBox(box)
+        for idx, label in enumerate(("周一", "周二", "周三", "周四", "周五", "周六", "周日")):
+            self._weekly_weekday.addItem(label, idx)
+        self._weekly_hour = _int_spin(0, 23, 20, " 点", box)
+        form.addRow("周报推送", self._weekly_enabled)
+        form.addRow("推送日", self._weekly_weekday)
+        form.addRow("推送时刻", self._weekly_hour)
+        self._growth_enabled = QCheckBox(
+            "成长体系（互动积累等级与形态，右键「陪伴统计」查看）", box)
+        form.addRow("成长体系", self._growth_enabled)
+        return box
+
     # ---------- 取值 / 回填 ----------
 
     def _load_from(self, cfg: AppConfig) -> None:
@@ -662,6 +693,22 @@ class SettingsDialog(QDialog):
             int(cfg.focus.default_min) if getattr(cfg, "focus", None) is not None else 25)
         self._bubble_duration.setValue(
             int(cfg.bubble.duration_s) if getattr(cfg, "bubble", None) is not None else 15)
+        tts = getattr(cfg, "tts", None)
+        self._tts_enabled.setChecked(tts.enabled if tts is not None else False)
+        self._tts_volume.setValue(int(tts.volume) if tts is not None else 100)
+        self._tts_rate.setValue(int(tts.rate) if tts is not None else 0)
+        notification = getattr(cfg, "notification", None)
+        self._notify_system.setChecked(notification.use_system
+                                        if notification is not None else False)
+        weekly = getattr(cfg, "weekly", None)
+        self._weekly_enabled.setChecked(weekly.enabled if weekly is not None else True)
+        wday = int(weekly.weekday) if weekly is not None else 6
+        widx = self._weekly_weekday.findData(wday)
+        if widx >= 0:
+            self._weekly_weekday.setCurrentIndex(widx)
+        self._weekly_hour.setValue(int(weekly.hour) if weekly is not None else 20)
+        growth = getattr(cfg, "growth", None)
+        self._growth_enabled.setChecked(growth.enabled if growth is not None else True)
         self._sync_reminder_labels()
 
     def _sync_reminder_labels(self) -> None:
@@ -726,10 +773,23 @@ class SettingsDialog(QDialog):
                       end_hour=int(self._dnd_end.value()))
         focus = replace(self._base.focus,
                         default_min=float(self._focus_default.value()))
+        tts = replace(self._base.tts,
+                      enabled=self._tts_enabled.isChecked(),
+                      volume=int(self._tts_volume.value()),
+                      rate=int(self._tts_rate.value()))
+        notification = replace(self._base.notification,
+                               use_system=self._notify_system.isChecked())
+        weekly = replace(self._base.weekly,
+                         enabled=self._weekly_enabled.isChecked(),
+                         weekday=int(self._weekly_weekday.currentData()),
+                         hour=int(self._weekly_hour.value()))
+        growth = replace(self._base.growth,
+                         enabled=self._growth_enabled.isChecked())
         return AppConfig(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                          vitals=self._base.vitals, reminders=reminders,
                          news=news, cheer=cheer, bubble=bubble, chat=chat,
-                         focus=focus, dnd=dnd), ""
+                         focus=focus, dnd=dnd, tts=tts, notification=notification,
+                         weekly=weekly, growth=growth), ""
 
     def _match_active_profile(self, cfg: AppConfig) -> str:
         """当前生效 ai 对应的方案名；找不到就用第一个方案。"""
