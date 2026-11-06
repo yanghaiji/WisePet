@@ -73,14 +73,18 @@ class Pet:
         self._go(BehaviorState.EATING)
         self._vitals = self._vitals.fed(FEED_HUNGER_GAIN)
 
-    def lift_mood_to(self, floor_value: float) -> bool:
-        """启动托底：快照心情低于 floor 时拉回（回来看到的是积极的宠物）。
+    def lift_for_fresh_start(self, floor_value: float) -> bool:
+        """开机元气启动：任一维度低于 floor_value 就托底到 floor_value（只升不降）。
 
-        返回是否发生变化；其它维度不动。
+        回来看到的是精神好的宠物，而不是一睁眼就拉着脸 / 喊饿喊困。返回是否发生变化。
         """
-        if self._vitals.mood >= floor_value:
+        v = self._vitals
+        lifted = VitalsVO(max(v.hunger, floor_value),
+                          max(v.mood, floor_value),
+                          max(v.energy, floor_value))
+        if lifted == v:
             return False
-        self._vitals = VitalsVO(self._vitals.hunger, floor_value, self._vitals.energy)
+        self._vitals = lifted
         return True
 
     def pet_head(self) -> None:

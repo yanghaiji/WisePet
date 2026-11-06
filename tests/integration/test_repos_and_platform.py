@@ -22,6 +22,7 @@ from WisePet.infra.platform_util import (
     create_fullscreen_detector,
     is_in_night,
     rect_covers_workarea,
+    set_notification_app_id,
 )
 from WisePet.infra.system_clock import SystemClock
 
@@ -269,3 +270,50 @@ class TestPlatformUtil:
             user32=SimpleNamespace(GetForegroundWindow=_boom)), raising=False)
 
         assert WindowsFullscreenDetector().is_user_fullscreen() is False
+
+    def should_skip_app_id_when_non_windows(self, monkeypatch):
+        """非 Windows 无 AUMID 概念，静默返回 False。"""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert set_notification_app_id("小墨") is False
+
+    @pytest.mark.parametrize("raw", ["", "   ", None])
+    def should_skip_app_id_when_blank(self, monkeypatch, raw):
+        """空宠物名不去设 AUMID，免得把 tile 设成空串。"""
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert set_notification_app_id(raw) is False
+
+    def should_set_app_id_when_win32_succeeds(self, monkeypatch):
+        """HRESULT==0 视为成功，并应把宠物名原样传给 API。"""
+        monkeypatch.setattr(sys, "platform", "win32")
+        calls = []
+
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+            shell32=SimpleNamespace(
+                SetCurrentProcessExplicitAppUserModelID=lambda v: calls.append(v) or 0)),
+            raising=False)
+
+        assert set_notification_app_id("小墨") is True
+        assert calls == ["小墨"]
+
+    @pytest.mark.parametrize("hresult", [1, -2147024891])
+    def should_report_false_when_win32_returns_error(self, monkeypatch, hresult):
+        """非 0 的 HRESULT 视为失败，返回 False 但不抛。"""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+            shell32=SimpleNamespace(
+                SetCurrentProcessExplicitAppUserModelID=lambda _v: hresult)), raising=False)
+
+        assert set_notification_app_id("小墨") is False
+
+    def should_report_false_when_app_id_api_raises(self, monkeypatch):
+        """shell32 不可用同样静默降级，不影响通知发出。"""
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        def _boom(*_args):
+            raise OSError("shell32 unavailable")
+
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
+            shell32=SimpleNamespace(SetCurrentProcessExplicitAppUserModelID=_boom)),
+            raising=False)
+
+        assert set_notification_app_id("小墨") is False

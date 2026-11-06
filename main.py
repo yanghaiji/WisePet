@@ -51,7 +51,6 @@ from WisePet.app.action_protocol import (                               # noqa: 
     parse_reminder_command,
 )
 from WisePet.app.cheer_service import CheerService                      # noqa: E402
-from WisePet.app.cheer_service import CheerService                      # noqa: E402
 from WisePet.app.chat_history import ChatHistory                        # noqa: E402
 from WisePet.app.chat_service import ChatService                       # noqa: E402
 from WisePet.app.event_bus import EventBus                              # noqa: E402
@@ -96,6 +95,7 @@ from WisePet.infra.growth_store import GrowthStore                     # noqa: E
 from WisePet.infra.instance_guard import InstanceGuard                 # noqa: E402
 from WisePet.infra.logger_setup import setup_logging                   # noqa: E402
 from WisePet.infra.news_feed import fetch_headlines                    # noqa: E402
+from WisePet.infra.platform_util import set_notification_app_id         # noqa: E402
 from WisePet.infra.reminder_store import ReminderStore                 # noqa: E402
 from WisePet.infra.tts import create_synthesizer                       # noqa: E402
 from WisePet.infra.weekly_store import WeeklyStore                     # noqa: E402
@@ -115,6 +115,7 @@ from WisePet.ui.screen_bounds import ScreenBounds                     # noqa: E4
 from WisePet.ui.settings_dialog import SettingsDialog                  # noqa: E402
 from WisePet.ui.speech_bubble import SpeechBubble                      # noqa: E402
 from WisePet.ui.stats_dialog import StatsDialog                        # noqa: E402
+from WisePet.ui.tech_effects import TechEffect                         # noqa: E402
 from WisePet.ui.tray_icon import HIDE_DISABLED_HINT, PetTrayIcon          # noqa: E402
 from WisePet.ui.tray_menu import PetMenu                               # noqa: E402
 
@@ -128,6 +129,12 @@ MOTION_INTERVAL_MS = 50
 PET_ID = "mochi"
 #: 宠物窗口边长与动画画布一致，便于把位置/锚点换算统一交给工作区 bounds
 PET_SIZE = CANVAS_SIZE
+#: 启动问候兜底语（未连模型或生成失败时；{name} 填宠物名）
+STARTUP_GREETING_FALLBACK = "{name}来召唤你啦，让我们开启美好的一天吧！"
+#: 开机问候的 AI 等待上限（秒）：远小于聊天 timeout_s，超时即回落兜底语，不拖慢开机问候
+GREETING_TIMEOUT_S = 6.0
+#: 开机元气基线：任一 vital 低于此值启动时一律托底，保证「一睁眼就精神」不触发求助
+FRESH_START_VITALS = 60.0
 
 #: 进程存活期必须持有单实例守卫，否则命名管道/端口会被回收释放
 _instance_guard: InstanceGuard | None = None
@@ -232,7 +239,7 @@ class PetApplication:
                              on_feed=self._on_feed,
                              on_pet_head=self._on_pet_head,
                              on_toggle_visible=self.toggle_visible,
-                             on_quit=self._app.quit,
+                             on_quit=self._exit_app,
                              on_reload=self.reload_assets,
                              on_history=self._show_history,
                              on_focus=lambda: self._start_focus(
@@ -279,8 +286,10 @@ class PetApplication:
         self._hotkey.start()
         self._sync_model_combo()
         self._sync_window()
+        self._window.setWindowOpacity(0.0)
         self._window.show()
         self._window.raise_()
+        self._play_tech_effect("spawn", on_done=self._fade_in_pet)
 
         self._tick_timer = QTimer(self._app)
         self._tick_timer.setInterval(TICK_INTERVAL_MS)
@@ -293,6 +302,7 @@ class PetApplication:
         self._motion_timer.timeout.connect(self.tick_motion)
         logger.info("pet started (assets dir=%s)", self._assets_dir)
         self._log_chat_brain(when="boot")
+        self._greet_on_start()   # 每次打开宠物：后台来一句昂扬问候，不拖冷启动
 
     def shutdown(self) -> None:
         """退出前取消在途请求并落盘状态（PRD US-4 离线恢复）。"""
@@ -306,6 +316,10 @@ class PetApplication:
         self._worker.wait(2000)
         if getattr(self, "_hotkey", None) is not None:
             self._hotkey.stop()
+        effect = getattr(self, "_tech_effect", None)
+        if effect is not None:
+            effect.stop()
+            effect.deleteLater()       # 不再触发 finished，避免触及已销毁的窗口
         self.save_state()
 
     def tick(self) -> None:
@@ -362,10 +376,12 @@ class PetApplication:
             # 上次被丢在半空：启动时一次性落回地面，而不是等重力慢慢掉（PRD v2.0 C10）
             # 自由漫游时不落回地面：猫住在整张桌面，恢复它上次待的高度
             pet.position = PositionVO(pet.position.x, y2)
-        if pet.lift_mood_to(60.0):
-            # 积极的宠物：旧快照心情衰减贴底会让猫一开机就拉着脸（用户反馈），
-            # 启动时把心情托底到 60，回来看到的是元气满满的那只
-            logger.info("mood lifted to 60 on restore (was low)")
+        # 每次开机都是「元气满满的新一天」：任一维度低于基线一律托底，且不补算关机期间的
+        # 离线衰减惩罚。否则旧快照精力/饱食见底时，宠物一睁眼就喊饿喊困求助，
+        # 和开机问候自相矛盾（PRD C34/C36）。
+        if pet.lift_for_fresh_start(FRESH_START_VITALS):
+            logger.info("vitals lifted to %d on fresh start (was low)", FRESH_START_VITALS)
+        pet.last_updated = self._clock.now()
         return pet
 
     def _local_context(self) -> LocalContext:
@@ -698,7 +714,9 @@ class PetApplication:
         """
         if not getattr(self._config.notification, "use_system", False):
             return False
-        title = event.title or "WisePet"
+        # tile（通知中心上方的应用名）固定用 WisePet；不设 AUMID 会回落成进程名「python」
+        set_notification_app_id("WisePet")
+        title = event.title or self._config.persona.name
         msec = int(max(3.0, float(self._config.bubble.duration_s)) * 1000)
         return self._tray.show_notification(title, event.text, msec=msec)
 
@@ -795,6 +813,47 @@ class PetApplication:
         except AIGatewayError as exc:
             logger.warning("cheer generate failed [%s]: %s", exc.kind, exc.detail)
             return None
+
+    def _generate_greeting(self) -> str | None:
+        """启动问候口号：AI 在线就生成一句积极昂扬的开场口号；未配置/失败返回 None。
+
+        问候是「开机第一眼」的体验，绝不能因为等 AI 而迟迟不出：这里把本次请求的
+        超时钳到 GREETING_TIMEOUT_S（远小于聊天默认的 30s），网关慢/不通时快速放弃、
+        由 _greeting_text 回落兜底语，保证问候几秒内必达。
+        """
+        ai = self._config.ai
+        if not ai.configured:
+            return None
+        prompt = (f"你是桌面宠物「{self._pet.name}」，主人刚把你打开。"
+                  f"来一句积极昂扬、简短有力的开场口号，唤醒主人元气满满地开启新一天，"
+                  f"不超过30字，直接输出正文，不要解释：")
+        greet_ai = replace(ai, timeout_s=min(ai.timeout_s, GREETING_TIMEOUT_S))
+        try:
+            slogan = self._ai_client.complete([{"role": "user", "content": prompt}], greet_ai)
+        except AIGatewayError as exc:
+            logger.warning("greeting generate failed [%s]: %s", exc.kind, exc.detail)
+            return None
+        slogan = str(slogan or "").strip()
+        return slogan[:60] or None
+
+    def _greeting_text(self) -> str:
+        """问候正文：AI 口号优先；未连模型或生成失败时，用宠物名兜底问候。"""
+        return (self._generate_greeting()
+                or STARTUP_GREETING_FALLBACK.format(name=self._pet.name))
+
+    def _greet_on_start(self) -> None:
+        """每次打开宠物：后台生成一句昂扬口号并推送，不阻塞冷启动（PRD <3s）。"""
+
+        def _work() -> None:
+            try:
+                text = self._greeting_text()
+            except Exception:  # noqa: BLE001 - 问候必达，任何异常都退回兜底语
+                logger.exception("greeting generation failed")
+                text = STARTUP_GREETING_FALLBACK.format(name=self._pet.name)
+            self._bus.publish(SpeakRequestedEvent(text, source="cheer",
+                                                  title="开启新的一天"))
+
+        threading.Thread(target=_work, name="wisepet-greet", daemon=True).start()
 
     def _summarize_news(self, headlines: list[str]) -> str | None:
         """新闻标题 → AI 摘要；未配 Key 或失败时返回 None（走纯标题播报）。"""
@@ -962,6 +1021,9 @@ class PetApplication:
 
     def toggle_visible(self) -> None:
         visible = self._window.isVisible()
+        if visible:
+            # 退场粒子在宠物原位爆散（纯装饰，隐藏本身立即生效）
+            self._play_tech_effect("exit")
         self._window.setVisible(not visible)
         self._menu.set_hidden_state(hidden=visible)
         self._tray.set_hidden_state(hidden=visible)
@@ -975,6 +1037,41 @@ class PetApplication:
         else:
             self._animator.start()
             self._sync_window()
+            self._play_tech_effect("spawn", on_done=self._fade_in_pet)
+
+    # ---------- 科技感出场/退场特效 ----------
+
+    def _play_tech_effect(self, mode: str, on_done: Callable[[], None] | None = None) -> None:
+        """在宠物中心播放粒子特效；on_done 特效结束后回调（主线程）。"""
+        center = self._window.frameGeometry().center()
+        effect = TechEffect(center, mode=mode)
+        self._tech_effect = effect             # 持引用防回收
+        if on_done is not None:
+            effect.finished.connect(on_done)
+        effect.start()
+
+    def _fade_in_pet(self) -> None:
+        """出场特效结束：宠物从透明淡入现身（220ms）。"""
+        self._fade_window(0.0, 1.0, 220)
+
+    def _fade_window(self, from_value: float, to_value: float, ms: int,
+                     on_done: Callable[[], None] | None = None) -> None:
+        from PySide6.QtCore import QPropertyAnimation
+        anim = QPropertyAnimation(self._window, b"windowOpacity", self._window)
+        anim.setDuration(ms)
+        anim.setStartValue(from_value)
+        anim.setEndValue(to_value)
+        if on_done is not None:
+            anim.finished.connect(on_done)
+        anim.start()
+        self._fade_anim = anim                 # 持引用防回收
+
+    def _exit_app(self) -> None:
+        """右键/托盘退出：先播退场特效再真正退出（窗口已隐藏时直接退）。"""
+        if self._window.isVisible():
+            self._play_tech_effect("exit", on_done=self._app.quit)
+        else:
+            self._app.quit()
 
     def _sync_window(self) -> None:
         self._window.sync_from_pet()

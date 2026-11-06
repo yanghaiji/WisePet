@@ -16,6 +16,7 @@ from WisePet.domain.errors import AIGatewayError
 from WisePet.domain.events import (
     ChatErrorEvent,
     KIND_WATER,
+    HelpRequestEvent,
     ReminderDueEvent,
     SpeakRequestedEvent,
 )
@@ -516,7 +517,7 @@ class TestFloorAndMotionTimer:
             app.shutdown()
 
     def should_lift_low_mood_to_positive_on_restore(self, qapp, tmp_path, assets_dir):
-        """积极的宠物：旧快照心情贴底时，启动托底到 60，别一开机就拉着脸。"""
+        """开机元气启动：旧快照三维贴底时全部托底到 60，别一开机就拉着脸/喊饿喊困。"""
         PetStateRepository(tmp_path).save(
             Pet(pet_id=main.PET_ID, name="墨墨", position=PositionVO(300, 10),
                 vitals=VitalsVO(hunger=40.0, mood=10.0, energy=40.0)))
@@ -524,7 +525,26 @@ class TestFloorAndMotionTimer:
         app = _build(qapp, tmp_path, assets_dir)
         try:
             assert app.pet.vitals.mood == 60.0
-            assert app.pet.vitals.hunger == 40.0      # 其它维度不动
+            assert app.pet.vitals.hunger == 60.0      # 三维都托底，不再“其它维度不动”
+            assert app.pet.vitals.energy == 60.0
+        finally:
+            app.shutdown()
+
+    def should_not_ask_for_help_on_fresh_start(self, qapp, tmp_path, assets_dir):
+        """开机把精力/饱食托底到元气基线，第一拍不该又冒“好困呀”求助（用户反馈）。"""
+        PetStateRepository(tmp_path).save(
+            Pet(pet_id=main.PET_ID, name="墨墨", position=PositionVO(300, 10),
+                vitals=VitalsVO(hunger=8.0, mood=8.0, energy=8.0)))
+        app = _build(qapp, tmp_path, assets_dir)
+        try:
+            helps = []
+            app._router.on(HelpRequestEvent, helps.append)
+
+            app.start()
+            app.tick()
+
+            assert helps == []
+            assert app.pet.vitals.energy >= 60.0
         finally:
             app.shutdown()
 
@@ -673,3 +693,82 @@ class TestTrayRestore:
 
     def should_not_quit_when_last_window_hidden(self, pet_app):
         assert pet_app._app.quitOnLastWindowClosed() is False
+
+
+class _SyncThread:
+    """把 threading.Thread 换成同步执行，便于确定性地测后台线程逻辑。"""
+
+    def __init__(self, target=None, name=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+
+class TestStartupGreeting:
+    """每次打开宠物先推送一句昂扬问候：AI 在线出模型口号，未连/失败用宠物名兜底。"""
+
+    def should_use_pet_name_fallback_when_ai_not_configured(self, pet_app):
+        text = pet_app._greeting_text()
+
+        assert pet_app._pet.name in text
+        assert "开启美好的一天" in text
+
+    def should_use_ai_slogan_when_configured(self, pet_app, monkeypatch):
+        cfg = pet_app._config
+        pet_app._config = replace(cfg, ai=replace(cfg.ai, api_key="sk-test"))
+        monkeypatch.setattr(pet_app._ai_client, "complete",
+                            lambda msgs, ai: "冲鸭，今天也要元气满满！")
+
+        assert pet_app._greeting_text() == "冲鸭，今天也要元气满满！"
+
+    def should_clamp_greeting_ai_timeout(self, pet_app, monkeypatch):
+        """问候的 AI 等待必须钳到上限：网关慢/不通时不至于拖住开机体验。"""
+        cfg = pet_app._config
+        pet_app._config = replace(cfg, ai=replace(cfg.ai, api_key="sk-test", timeout_s=30.0))
+        seen = {}
+
+        def _capture(msgs, ai):
+            seen["timeout_s"] = ai.timeout_s
+            return "口号"
+
+        monkeypatch.setattr(pet_app._ai_client, "complete", _capture)
+
+        pet_app._generate_greeting()
+
+        assert seen["timeout_s"] == main.GREETING_TIMEOUT_S
+
+    def should_fallback_when_ai_raises(self, pet_app, monkeypatch):
+        """模型报错也不能不问候：退回含宠物名的兜底语。"""
+        cfg = pet_app._config
+        pet_app._config = replace(cfg, ai=replace(cfg.ai, api_key="sk-test"))
+
+        def _boom(*_a, **_k):
+            raise AIGatewayError(AIGatewayError.NETWORK, "dns down")
+
+        monkeypatch.setattr(pet_app._ai_client, "complete", _boom)
+        text = pet_app._greeting_text()
+
+        assert pet_app._pet.name in text
+        assert "开启美好的一天" in text
+
+    def should_publish_greeting_event_when_greet_on_start(self, pet_app, monkeypatch):
+        captured = []
+        pet_app._router.on(SpeakRequestedEvent, captured.append)
+        monkeypatch.setattr(main.threading, "Thread", _SyncThread)
+
+        pet_app._greet_on_start()
+
+        assert captured
+        assert captured[-1].title == "开启新的一天"
+        assert pet_app._pet.name in captured[-1].text
+
+    def should_trigger_greeting_on_start(self, pet_app, monkeypatch):
+        """start() 会拉起问候（只验证调用，不依赖真线程/事件循环）。"""
+        called = []
+        monkeypatch.setattr(pet_app, "_greet_on_start", lambda: called.append(1))
+
+        pet_app.start()
+
+        assert called

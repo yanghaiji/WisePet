@@ -74,3 +74,22 @@ def create_fullscreen_detector():
     if sys.platform == "win32":
         return WindowsFullscreenDetector()
     return NullFullscreenDetector()
+
+
+def set_notification_app_id(app_id: str) -> bool:
+    """设置 Windows 通知中心里 toast 上方的「应用名 / tile」。
+
+    不显式声明 AppUserModelID 时，Windows 用宿主进程名当 tile——开发态跑在
+    python.exe 上就显示成「python」，用户看到的通知来源很出戏。这里把 tile
+    换成应用名（WisePet），让通知归属清晰。非 Windows 平台或 API 失败返回 False
+    （尽力而为，不影响通知照常发出）。
+    """
+    if sys.platform != "win32" or not str(app_id or "").strip():
+        return False
+    try:
+        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+        # SetCurrentProcessExplicitAppUserModelID 返回 HRESULT，0(S_OK) 为成功
+        return shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id)) == 0
+    except Exception:  # noqa: BLE001 - 平台 API 尽力而为，失败不阻断通知
+        logger.debug("set notification app id failed", exc_info=True)
+        return False
