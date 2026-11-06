@@ -20,7 +20,7 @@ loader 只按文件名排序轮播、不做任何对齐——直接丢进去的�
     --preview            额外输出 tmp/imported-{skin}.png 总览图供目检
 
 素材落盘契约（tests/integration/test_pet_assets.py 会校验）：
-    assets/pet/{skin}/{action}/01.png … 05.png，256×256、RGBA、透明背景、每动作正好 6 帧。
+    assets/pet/{skin}/{action}/01.png … 09.png，256×256、RGBA、透明背景、每动作正好 10 帧。
 """
 from __future__ import annotations
 
@@ -669,7 +669,7 @@ def _collect(src_dir: Path, layout: str) -> dict[str, list[Path]]:
 def _pick(cells: list[QImage], want: int) -> list[QImage]:
     """从网格/目录里抽 `want` 帧：多于就等间隔采样，少于就报错。
 
-    AI 常出 2×4=8 格，而程序契约是每动作 6 帧。等间隔取（`i*len/want` 向下取整）
+    AI 常出 2×5=10 格，而程序契约是每动作 10 帧。等间隔取（`i*len/want` 向下取整）
     而不是截前六张：截断会把循环的尾段丢掉，播起来最后一帧硬跳回第一帧。
     """
     if len(cells) < want:
@@ -810,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--layout", default="grid", choices=("grid", "single"),
                         help="grid=一动作一张网格图（默认）；single=一帧一张图")
     parser.add_argument("--rows", type=int, default=2, help="grid 模式行数")
-    parser.add_argument("--cols", type=int, default=3, help="grid 模式列数")
+    parser.add_argument("--cols", type=int, default=5, help="grid 模式列数")
     parser.add_argument("--frames", type=int, default=FRAMES_PER_ACTION,
                         help=f"每个动作最终落盘几帧（程序契约 {FRAMES_PER_ACTION}）；"
                              f"格数多于它会等间隔采样，少于它报错")

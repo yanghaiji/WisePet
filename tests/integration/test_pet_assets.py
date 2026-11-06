@@ -1,4 +1,4 @@
-"""仓库内桌宠素材完整性：assets/pet/{skin}/{action}/ 每动作 6 帧真实 PNG（PRD v2.0 C11）。
+"""仓库内桌宠素材完整性：assets/pet/{skin}/{action}/ 每动作 10 帧真实 PNG（PRD v2.0 C11）。
 
 素材有两条来路：tools/gen_pet_assets.py 程序生成，或 tools/import_pet_images.py
 导入外部 AI 图。本测试只校“已落盘素材”的契约（不关心动画长什么样），按已安装皮肤动态取参，
@@ -18,7 +18,7 @@ from WisePet.domain.config_model import DEFAULT_SKIN, PET_SKINS
 from WisePet.infra.frame_loader import ACTIONS, FrameAssetLoader
 
 ASSETS_ROOT = Path(__file__).resolve().parents[2] / "assets"
-FRAMES_PER_ACTION = 6
+FRAMES_PER_ACTION = 10
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 #: 正常帧约 10~30KB；低于此值基本可判定为截断/空文件
 MIN_FRAME_BYTES = 1000
@@ -50,7 +50,7 @@ def should_ship_ten_actions_in_source_of_truth():
 
 @pytest.mark.parametrize("skin", INSTALLED_SKINS)
 @pytest.mark.parametrize("action", sorted(ACTIONS))
-def should_ship_six_frames_when_assets_generated(skin, action):
+def should_ship_expected_frames_when_assets_generated(skin, action):
     frames = FrameAssetLoader(ASSETS_ROOT, skin).frames(action)
 
     assert len(frames) == FRAMES_PER_ACTION, f"{skin}/{action}"

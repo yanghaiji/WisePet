@@ -54,7 +54,7 @@ class TestCycleSeconds:
         assert cycle_seconds("eat") == FRAMES_PER_ACTION / FPS_BY_ACTION["eat"]
 
     def should_honor_actual_frame_count_when_assets_differ(self):
-        assert cycle_seconds("eat", frames=12) == 2 * cycle_seconds("eat")
+        assert cycle_seconds("eat", frames=2 * FRAMES_PER_ACTION) == 2 * cycle_seconds("eat")
 
 
 class TestWholeCycleDuration:

@@ -753,7 +753,7 @@ class TestRunAndStretch:
         ctx = make_ctx(idle_s=2.0, stretch_p=0.5, rng=StubRng(values=[0.1]))
         ctx["clock"].advance(3.0)
         ctx["controller"].tick()                     # → STRETCHING
-        ctx["clock"].advance(2.0)                    # ≥ 1.5s 动画时长（伸懒腰上调后要看得见）
+        ctx["clock"].advance(2.6)                    # ≥ 2.5s 收场时长（10 帧一圈 1.25s，向上整圈=2.5s）
         ctx["controller"].tick_motion()
         assert ctx["pet"].state is BehaviorState.IDLE
 
@@ -799,7 +799,7 @@ class TestAutonomousShowcase:
             ctx = make_ctx(idle_s=1e9)
             ctx["controller"]._transition_to(state, autonomous=True)
             ctx["controller"].tick()              # 建立收场起算点
-            ctx["clock"].advance(3.0)
+            ctx["clock"].advance(4.0)             # 盖过最长收场（THINKING 10 帧一圈 1.25s → 3.75s）
             ctx["controller"].tick_motion()
 
             assert ctx["pet"].state is BehaviorState.IDLE, state

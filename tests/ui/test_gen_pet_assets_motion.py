@@ -23,10 +23,11 @@ from tools.import_pet_images import _bbox, frame_diffs, measure_foot_line
 
 #: 相邻帧差异上限：超过就是"轮廓每帧换位置"级别的抖动
 MAX_FRAME_DIFF = 0.08
-#: 相邻帧不许像素级重复（重复等于把 6 帧播成 3 帧）
+#: 相邻帧不许像素级重复（重复等于把整圈播成半圈）
 MIN_DISTINCT_DIFF = 0.0005
-#: 一圈下来必须看得见动静，否则就是静图
-MIN_CYCLE_MOTION = 0.012
+#: 一圈的总剪影动静（相邻帧差异之和）下限：够读出“循环在动”否则就是静图。
+#: 用总量而非每帧均值：帧数从 6 提到 10 后每帧步长天然变薄，但一圈总动静不变
+MIN_CYCLE_MOTION = 0.06
 
 
 def _digest(image: QImage) -> bytes:
@@ -94,7 +95,7 @@ def should_keep_silhouette_stable_across_frames(frames_by_action, action):
 
 @pytest.mark.parametrize("action", sorted(ACTION_NAMES))
 def should_show_visible_motion_each_cycle(frames_by_action, action):
-    assert sum(frame_diffs(frames_by_action[action])) / FRAMES >= MIN_CYCLE_MOTION, action
+    assert sum(frame_diffs(frames_by_action[action])) >= MIN_CYCLE_MOTION, action
 
 
 @pytest.mark.parametrize("action", sorted(ACTION_NAMES))

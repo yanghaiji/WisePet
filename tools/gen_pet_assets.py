@@ -797,9 +797,12 @@ def _pose(action: str, index: int) -> dict:
         # 实测成对帧落盘字节完全相同（目检与静图无异），播起来是「顿顿顿」而不是疼。
         # 也不能衰减得太快：一圈平均差异低于 1.2% 就报静图，所以拖个摆尾兼打底。
         flinch = wave * (1.0 - index / (FRAMES + 1)) * 6.0
-        cfg.update(ear_droop=1.5, eye="hurt", mouth="grimace", head_dy=2.0 + wave * 1.5,
-                   bob=flinch + sway * 0.8, squash=1.04 + wave * 0.012, tail_lift=0.1,
-                   blush=False, tail_sway=flinch * 0.25 + sway * 0.5)
+        # 恢复段叠一层连续 sway 微摆：flinch 衰减到尾部会几乎静止（10 帧里
+        # 8→9 只差 0.5px 看着像死帧），用不过零的 sway 把收尾撑住，疼完自然回稳
+        cfg.update(ear_droop=1.5, eye="hurt", mouth="grimace",
+                   head_dy=2.0 + wave * 1.5 + sway * 1.2,
+                   bob=flinch + sway * 1.6, squash=1.04 + wave * 0.012, tail_lift=0.1,
+                   blush=False, tail_sway=flinch * 0.25 + sway * 0.8)
     elif action == "think":
         # 歪头随呼吸摆动 + 一次眨眼：只靠头顶那滴汗看不出一只在思考
         cfg.update(mouth="flat", sweat=index >= 3, eye_dy=-2.0,

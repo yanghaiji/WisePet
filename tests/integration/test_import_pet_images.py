@@ -14,7 +14,7 @@ import pytest
 TOOL = Path(__file__).resolve().parents[2] / "tools" / "import_pet_images.py"
 SIZE = 256
 RGBA_COLOR_TYPE = 6
-FRAMES_PER_ACTION = 6
+FRAMES_PER_ACTION = 10
 
 
 def _chunk(tag: bytes, data: bytes) -> bytes:
@@ -69,16 +69,17 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def grid_src(tmp_path):
-    """造 2 个动作 × 6 帧的网格图（2×3），每格色块大小与站位都不同。"""
+    """造 2 个动作 × 10 帧的网格图（2×5），每格色块大小与站位都不同。"""
     src = tmp_path / "ai"
     src.mkdir()
-    blobs = [(4, 20, 18), (10, 6, 26), (2, 14, 22), (16, 18, 14), (8, 8, 30), (20, 24, 10)]
+    blobs = [(4, 20, 18), (10, 6, 26), (2, 14, 22), (16, 18, 14), (8, 8, 30),
+             (20, 24, 10), (6, 30, 20), (12, 10, 24), (3, 40, 16), (22, 12, 12)]
     for action in ("idle", "walk"):
-        _write_rgb_png(src / f"{action}.png", 120, 120, _grid_sheet(120, 120, 2, 3, blobs))
+        _write_rgb_png(src / f"{action}.png", 200, 120, _grid_sheet(200, 120, 2, 5, blobs))
     return src
 
 
-def should_import_grid_sheet_into_six_square_rgba_frames(grid_src, tmp_path):
+def should_import_grid_sheet_into_ten_square_rgba_frames(grid_src, tmp_path):
     out = tmp_path / "assets"
 
     result = _run(["--in", str(grid_src), "--skin", "cat", "--out", str(out)])
@@ -103,16 +104,17 @@ def should_warn_but_still_succeed_when_actions_missing(grid_src, tmp_path):
     assert "run" in reported and "idle" not in reported
 
 
-def should_sample_six_frames_from_oversized_grid(tmp_path):
-    """AI 常出 2×4=8 格：必须等间隔抽成契约的 6 帧，而不是拒收或截前六张。"""
+def should_sample_ten_frames_from_oversized_grid(tmp_path):
+    """AI 常出 2×6=12 格：必须等间隔抽成契约的 10 帧，而不是拒收或截前十张。"""
     src = tmp_path / "ai"
     src.mkdir()
     blobs = [(4, 20, 18), (10, 6, 26), (2, 14, 22), (16, 18, 14),
-             (8, 8, 30), (20, 24, 10), (6, 16, 24), (14, 10, 16)]
-    _write_rgb_png(src / "idle.png", 160, 80, _grid_sheet(160, 80, 2, 4, blobs))
+             (8, 8, 30), (20, 24, 10), (6, 16, 24), (14, 10, 16),
+             (3, 30, 20), (12, 8, 26), (18, 22, 14), (9, 14, 22)]
+    _write_rgb_png(src / "idle.png", 240, 120, _grid_sheet(240, 120, 2, 6, blobs))
     out = tmp_path / "assets"
 
-    result = _run(["--in", str(src), "--skin", "cat", "--rows", "2", "--cols", "4",
+    result = _run(["--in", str(src), "--skin", "cat", "--rows", "2", "--cols", "6",
                    "--out", str(out)])
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -158,17 +160,18 @@ def should_reject_single_layout_with_wrong_frame_count(tmp_path):
                    "--out", str(tmp_path / "assets")])
 
     assert result.returncode == 1
-    assert "每动作需要 6 帧" in result.stdout
+    assert "每动作需要 10 帧" in result.stdout
 
 
 def should_fail_when_a_cell_has_no_content(tmp_path):
     """整格纯背景：抠完没内容必须报错，而不是静默写一张全透明的帧。"""
     src = tmp_path / "ai"
     src.mkdir()
-    _write_rgb_png(src / "idle.png", 120, 120, _grid_sheet(120, 120, 2, 3,
-                                                           [(10, 10, 20)] * 5 + [(0, 0, 0)]))
+    _write_rgb_png(src / "idle.png", 200, 120, _grid_sheet(200, 120, 2, 5,
+                                                           [(10, 10, 20)] * 9 + [(0, 0, 0)]))
 
-    result = _run(["--in", str(src), "--skin", "cat", "--out", str(tmp_path / "assets")])
+    result = _run(["--in", str(src), "--skin", "cat", "--rows", "2", "--cols", "5",
+                   "--out", str(tmp_path / "assets")])
 
     assert result.returncode == 1
     assert "透明的" in result.stdout
