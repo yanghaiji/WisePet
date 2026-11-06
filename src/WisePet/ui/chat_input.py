@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
     QVBoxLayout, QWidget,
@@ -72,7 +73,8 @@ class ChatInput(QWidget):
     model_selected = Signal(str)
 
     def __init__(self, screen_bounds: ScreenBounds | None = None,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None,
+                 idle_hide_provider: Callable[[], float] | None = None):
         super().__init__(parent)
         self._screen = screen_bounds
         self._active = False
@@ -81,6 +83,11 @@ class ChatInput(QWidget):
         self._detail = ""
         self._history_count = 0
         self._attachments: list[Attachment] = []
+        # 空闲自动隐藏：无交互超过 provider() 秒收起（provider 为 None 或返回 0 则不隐藏）
+        self._idle_hide_provider = idle_hide_provider
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.timeout.connect(self._on_idle_timeout)
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -107,6 +114,7 @@ class ChatInput(QWidget):
         self._edit.send_requested.connect(self._submit)
         self._edit.dismissed.connect(self._on_dismissed)
         self._edit.image_pasted.connect(self._add_clipboard_image)
+        self._edit.textChanged.connect(self._restart_idle_timer)
 
         self._attach_btn = QPushButtonAttach(card)
         self._attach_btn.setObjectName("attach")
@@ -156,6 +164,7 @@ class ChatInput(QWidget):
         self.activateWindow()
         self._edit.setFocus()
         self._emit_active(True)
+        self._restart_idle_timer()
 
     def follow_pet(self, pet_rect) -> None:
         """宠物挪窝后重新贴边：只改坐标，不抢焦点也不重发激活信号（FR v1.10 C18）。"""
@@ -186,6 +195,7 @@ class ChatInput(QWidget):
             self._brain = source
         self._detail = detail
         self._refresh_status()
+        self._restart_idle_timer()
 
     @property
     def status_text(self) -> str:
@@ -286,8 +296,29 @@ class ChatInput(QWidget):
         self._edit.clear()
         self.take_attachments()
         self._edit.setFocus()       # 回复期间可继续输入
+        self._restart_idle_timer()
+
+    def _restart_idle_timer(self) -> None:
+        """有交互（打开/输入/发送/回复）即重新计时；关闭态或禁用时停表。"""
+        if self._idle_hide_provider is None or not self.isVisible():
+            self._idle_timer.stop()
+            return
+        try:
+            seconds = float(self._idle_hide_provider() or 0.0)
+        except (TypeError, ValueError):
+            self._idle_timer.stop()
+            return
+        if seconds <= 0:
+            self._idle_timer.stop()
+            return
+        self._idle_timer.start(int(seconds * 1000))
+
+    def _on_idle_timeout(self) -> None:
+        if self.isVisible():
+            self.hide()
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        self._idle_timer.stop()
         self._emit_active(False)
         super().hideEvent(event)
 

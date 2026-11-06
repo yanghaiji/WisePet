@@ -227,19 +227,19 @@ def is_cancel_reminders_command(text: str) -> bool:
     return bool(_CANCEL_RE.fullmatch(str(text or "").strip()))
 
 
-def parse_focus_command(text: str) -> float | None:
-    """「专注25分钟」「来个番茄钟」→ 专注分钟数；不匹配返回 None。"""
+def parse_focus_command(text: str, default_min: float = DEFAULT_FOCUS_MIN) -> float | None:
+    """「专注25分钟」「来个番茄钟」→ 专注分钟数；没说时长用 default_min；不匹配返回 None。"""
     stripped = str(text or "").strip()
     if "番茄钟" in stripped:
         match = _DELAY_RE.search(stripped)
         if match is not None and match.group("unit") in ("分钟", "分"):
             return min(MAX_FOCUS_MIN, max(1.0, float(match.group("num"))))
-        return DEFAULT_FOCUS_MIN
+        return default_min
     if "专注" in stripped:
         match = re.search(r"(\d+(?:\.\d+)?)\s*个?\s*分钟", stripped)
         if match is not None:
             return min(MAX_FOCUS_MIN, max(1.0, float(match.group(1))))
-        return DEFAULT_FOCUS_MIN
+        return default_min
     return None
 
 

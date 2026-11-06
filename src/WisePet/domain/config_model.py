@@ -110,6 +110,18 @@ class BubbleSettings:
 
 
 @dataclass
+class ChatSettings:
+    """聊天输入条空闲行为：无交互超过 idle_hide_s 秒自动收起（0 = 不自动隐藏）。"""
+    idle_hide_s: float = 30.0
+
+
+@dataclass
+class FocusSettings:
+    """番茄钟：默认专注时长，一句话（「来个番茄钟」）与右键菜单都取这个值。"""
+    default_min: float = 25.0
+
+
+@dataclass
 class DndSettings:
     """勿扰时段：周期提醒/新闻/鼓励顺延到时段结束；一句话定时提醒不受影响。"""
     enabled: bool = False
@@ -136,6 +148,8 @@ class AppConfig:
     news: NewsSettings = field(default_factory=NewsSettings)
     cheer: CheerSettings = field(default_factory=CheerSettings)
     bubble: BubbleSettings = field(default_factory=BubbleSettings)
+    chat: ChatSettings = field(default_factory=ChatSettings)
+    focus: FocusSettings = field(default_factory=FocusSettings)
     dnd: DndSettings = field(default_factory=DndSettings)
 
     def to_dict(self) -> dict:
@@ -234,6 +248,15 @@ class AppConfig:
         bubble = BubbleSettings(
             duration_s=max(3.0, _num(b_d.get("duration_s"), defaults.bubble.duration_s)),
         )
+        ch_d = data.get("chat") or {}
+        chat = ChatSettings(
+            idle_hide_s=max(0.0, _num(ch_d.get("idle_hide_s"), defaults.chat.idle_hide_s)),
+        )
+        f_d = data.get("focus") or {}
+        focus = FocusSettings(
+            default_min=min(180.0, max(1.0, _num(f_d.get("default_min"),
+                                                 defaults.focus.default_min))),
+        )
         d_d = data.get("dnd") or {}
         dnd = DndSettings(
             enabled=_bool(d_d.get("enabled"), defaults.dnd.enabled),
@@ -242,7 +265,7 @@ class AppConfig:
         )
         return cls(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                    vitals=vitals, reminders=reminders, news=news, cheer=cheer,
-                   bubble=bubble, dnd=dnd)
+                   bubble=bubble, chat=chat, focus=focus, dnd=dnd)
 
 
 def _parse_profiles(raw, ai: AIConfig) -> list:

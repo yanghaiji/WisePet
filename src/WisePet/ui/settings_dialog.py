@@ -366,6 +366,7 @@ class SettingsDialog(QDialog):
         # 滚轮停在数值框 / 下拉上时只滚页面，不偷偷改值（FR v1.14 C24）
         value_widgets = (self._temperature, self._timeout, self._walk_speed,
                          self._idle_min, self._idle_max, self._max_turns,
+                         self._chat_idle_hide,
                          self._water_interval, self._sedentary_interval)
         for widget in value_widgets + (self._skin,):
             widget.wheel_target = self._scroll.viewport()
@@ -560,6 +561,9 @@ class SettingsDialog(QDialog):
         form.addRow("闲置间隔下限", self._idle_min)
         form.addRow("闲置间隔上限", self._idle_max)
         form.addRow("历史保留", self._max_turns)
+        self._chat_idle_hide = _int_spin(0, 600, 30, " s", box)
+        self._chat_idle_hide.setToolTip("聊天输入条多久没交互就自动收起；0 = 不自动隐藏")
+        form.addRow("聊天框空闲隐藏", self._chat_idle_hide)
         form.addRow("贴地", self._stick_to_floor)
         form.addRow("漫游", self._roam)
         self._roam_jump_interval = _int_spin(0, 600, 30, " s", box)
@@ -588,6 +592,9 @@ class SettingsDialog(QDialog):
         holder = QWidget(box)
         holder.setLayout(start_end)
         form.addRow("", holder)
+        self._focus_default = _int_spin(1, 180, 25, " min", box)
+        self._focus_default.setToolTip("说「来个番茄钟」或右键菜单时的默认专注时长")
+        form.addRow("专注时长", self._focus_default)
         return box
 
     def _build_reminder_group(self, parent: QWidget) -> QFrame:
@@ -629,6 +636,8 @@ class SettingsDialog(QDialog):
         self._idle_min.setValue(int(cfg.pet.idle_min_s))
         self._idle_max.setValue(int(cfg.pet.idle_max_s))
         self._max_turns.setValue(int(cfg.pet.max_turns))
+        self._chat_idle_hide.setValue(
+            int(cfg.chat.idle_hide_s) if getattr(cfg, "chat", None) is not None else 30)
         self._stick_to_floor.setChecked(cfg.pet.stick_to_floor)
         self._roam.setChecked(getattr(cfg.pet, "roam", True))
         self._roam_jump_interval.setValue(int(getattr(cfg.pet, "roam_jump_interval_s", 30)))
@@ -649,6 +658,8 @@ class SettingsDialog(QDialog):
         self._dnd_enabled.setChecked(dnd.enabled if dnd is not None else False)
         self._dnd_start.setValue(int(dnd.start_hour) if dnd is not None else 12)
         self._dnd_end.setValue(int(dnd.end_hour) if dnd is not None else 14)
+        self._focus_default.setValue(
+            int(cfg.focus.default_min) if getattr(cfg, "focus", None) is not None else 25)
         self._bubble_duration.setValue(
             int(cfg.bubble.duration_s) if getattr(cfg, "bubble", None) is not None else 15)
         self._sync_reminder_labels()
@@ -708,13 +719,17 @@ class SettingsDialog(QDialog):
                         enabled=self._cheer_enabled.isChecked(),
                         interval_min=float(self._cheer_interval.value()))
         bubble = BubbleSettings(duration_s=float(self._bubble_duration.value()))
+        chat = replace(self._base.chat, idle_hide_s=float(self._chat_idle_hide.value()))
         dnd = replace(self._base.dnd,
                       enabled=self._dnd_enabled.isChecked(),
                       start_hour=int(self._dnd_start.value()),
                       end_hour=int(self._dnd_end.value()))
+        focus = replace(self._base.focus,
+                        default_min=float(self._focus_default.value()))
         return AppConfig(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                          vitals=self._base.vitals, reminders=reminders,
-                         news=news, cheer=cheer, bubble=bubble, dnd=dnd), ""
+                         news=news, cheer=cheer, bubble=bubble, chat=chat,
+                         focus=focus, dnd=dnd), ""
 
     def _match_active_profile(self, cfg: AppConfig) -> str:
         """当前生效 ai 对应的方案名；找不到就用第一个方案。"""

@@ -133,6 +133,20 @@ def should_let_pet_stay_anywhere_when_stick_to_floor_off(qtbot, base_config):
     assert cfg.pet.fall_speed_px_per_s == base_config.pet.fall_speed_px_per_s
 
 
+def should_roundtrip_chat_idle_hide_seconds(qtbot, base_config):
+    """聊天框空闲隐藏时长：默认回填 30，改后保存能取回（PRD 需求）。"""
+    dialog = SettingsDialog(base_config)
+    qtbot.addWidget(dialog)
+
+    assert dialog._chat_idle_hide.value() == 30
+    dialog._chat_idle_hide.setValue(15)
+
+    cfg, error = dialog.collect()
+
+    assert error == ""
+    assert cfg.chat.idle_hide_s == 15.0
+
+
 def should_reject_when_idle_min_exceeds_max(qtbot, base_config):
     dialog = SettingsDialog(base_config)
     qtbot.addWidget(dialog)

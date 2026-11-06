@@ -136,3 +136,56 @@ class TestFollowPet:
         chat_input.follow_pet(QRect(pet_rect.left() + 150, pet_rect.top(), 128, 128))
 
         assert chat_input.pos() == before
+
+
+class TestIdleAutoHide:
+    """聊天输入条空闲自动隐藏：无交互超过配置秒数收起；0/未配置不隐藏。"""
+
+    def _make(self, fake_screen, pet_rect, qtbot, provider):
+        widget = ChatInput(fake_screen, idle_hide_provider=provider)
+        qtbot.addWidget(widget)
+        return widget
+
+    def should_start_countdown_when_shown(self, fake_screen, pet_rect, qtbot):
+        widget = self._make(fake_screen, pet_rect, qtbot, lambda: 30)
+
+        widget.show_near(pet_rect)
+
+        assert widget._idle_timer.isActive()
+
+    def should_not_countdown_when_disabled(self, fake_screen, pet_rect, qtbot):
+        widget = self._make(fake_screen, pet_rect, qtbot, lambda: 0)
+
+        widget.show_near(pet_rect)
+
+        assert not widget._idle_timer.isActive()
+
+    def should_not_countdown_without_provider(self, fake_screen, pet_rect, qtbot):
+        widget = self._make(fake_screen, pet_rect, qtbot, None)
+
+        widget.show_near(pet_rect)
+
+        assert not widget._idle_timer.isActive()
+
+    def should_stop_countdown_when_hidden(self, fake_screen, pet_rect, qtbot):
+        widget = self._make(fake_screen, pet_rect, qtbot, lambda: 30)
+        widget.show_near(pet_rect)
+
+        widget.hide()
+
+        assert not widget._idle_timer.isActive()
+
+    def should_hide_itself_when_idle_elapsed(self, fake_screen, pet_rect, qtbot):
+        widget = self._make(fake_screen, pet_rect, qtbot, lambda: 0.05)
+        widget.show_near(pet_rect)
+
+        qtbot.waitUntil(lambda: not widget.isVisible(), timeout=1000)
+
+    def should_rearm_countdown_when_typing(self, fake_screen, pet_rect, qtbot):
+        widget = self._make(fake_screen, pet_rect, qtbot, lambda: 30)
+        widget.show_near(pet_rect)
+        widget._idle_timer.stop()          # 模拟倒计时已走完
+
+        widget.line_edit.setText("输入中")
+
+        assert widget._idle_timer.isActive()

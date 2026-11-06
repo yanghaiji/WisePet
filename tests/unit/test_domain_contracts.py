@@ -59,3 +59,10 @@ class TestConfigParsing:
 
     def should_fall_back_to_defaults_when_payload_not_mapping(self):
         assert AppConfig.from_dict(None).persona.name == AppConfig().persona.name
+
+    def should_default_and_clamp_chat_idle_hide_seconds(self):
+        """聊天框空闲隐藏时长：默认 30s，可从 json 改，负值钳 0、非法回默认。"""
+        assert AppConfig().chat.idle_hide_s == 30.0
+        assert AppConfig.from_dict({"chat": {"idle_hide_s": 10}}).chat.idle_hide_s == 10.0
+        assert AppConfig.from_dict({"chat": {"idle_hide_s": -5}}).chat.idle_hide_s == 0.0
+        assert AppConfig.from_dict({"chat": {"idle_hide_s": "x"}}).chat.idle_hide_s == 30.0

@@ -55,7 +55,7 @@ from WisePet.app.cheer_service import CheerService                      # noqa: 
 from WisePet.app.chat_history import ChatHistory                        # noqa: E402
 from WisePet.app.chat_service import ChatService                       # noqa: E402
 from WisePet.app.event_bus import EventBus                              # noqa: E402
-from WisePet.app.focus_service import FocusService                     # noqa: E402
+from WisePet.app.focus_service import FocusLog, FocusService           # noqa: E402
 from WisePet.app.local_responder import LocalContext, LocalResponder    # noqa: E402
 from WisePet.app.news_service import NewsService                       # noqa: E402
 from WisePet.app.one_shot_reminders import OneShotReminders             # noqa: E402
@@ -99,10 +99,12 @@ from WisePet.infra.pet_state_repo import PetStateRepository            # noqa: E
 from WisePet.infra.system_clock import SystemClock                     # noqa: E402
 from WisePet.ui.ai_worker import AiWorker                              # noqa: E402
 from WisePet.ui.chat_input import ChatInput                             # noqa: E402
+from WisePet.ui.chat_text_edit import attachment_from_clipboard_image   # noqa: E402
 from WisePet.ui.chat_window import ChatWindow                           # noqa: E402
 from WisePet.ui.frame_animator import CANVAS_SIZE, FrameAnimator       # noqa: E402
 from WisePet.ui.pet_window import PetWindow                            # noqa: E402
 from WisePet.ui.qt_bridge import EventRouter, QtEventBridge            # noqa: E402
+from WisePet.ui.region_selector import RegionSelector                   # noqa: E402
 from WisePet.ui.screen_bounds import ScreenBounds                     # noqa: E402
 from WisePet.ui.settings_dialog import SettingsDialog                  # noqa: E402
 from WisePet.ui.speech_bubble import SpeechBubble                      # noqa: E402
@@ -202,7 +204,8 @@ class PetApplication:
                                  lambda: self._config, self._screen, size=PET_SIZE)
         self._bubble = SpeechBubble(
             self._screen, duration_provider=lambda: self._config.bubble.duration_s)
-        self._chat_input = ChatInput(self._screen)     # 点宠物：正常聊天（单行输入条）
+        self._chat_input = ChatInput(self._screen,                # 点宠物：正常聊天（单行输入条）
+                                     idle_hide_provider=lambda: self._config.chat.idle_hide_s)
         self._chat_window = ChatWindow(                # 右键：可继续聊的历史窗
             self._screen,
             days_provider=self._chat_history.days,
@@ -214,7 +217,8 @@ class PetApplication:
                              on_quit=self._app.quit,
                              on_reload=self.reload_assets,
                              on_history=self._show_history,
-                             on_focus=lambda: self._start_focus(25.0),
+                             on_focus=lambda: self._start_focus(
+                                 self._config.focus.default_min),
                              on_stats=self._show_stats,
                              on_screenshot=self._screenshot_ask)
         self._stats_dialog = StatsDialog(self._screen)
@@ -351,7 +355,7 @@ class PetApplication:
                             skin=self._config.pet.skin)
 
     def _system_prompt(self) -> str:
-        """人设模板 + 当前心情摘要 + 可执行操作协议（PRD C3 / M4 业务规则）。"""
+        """人设模板 + 当前心情摘要 + 当前时间 + 可执行操作协议（PRD C3 / M4）。"""
         template = self._config.persona.system_prompt
         try:
             base = template.format(name=self._pet.name,
@@ -360,7 +364,11 @@ class PetApplication:
             # 模板占位符写错也不能崩（PRD 可靠性）：原文 + 状态拼接
             logger.warning("persona template malformed, append summary instead")
             base = f"{template}\n当前状态：{self._pet.vitals_summary()}"
-        return base + ACTION_PROMPT_GUIDE
+        # 模型自己没有时钟：注入当前时间，否则用户问「几点了」会答不上来
+        local = time.localtime(self._clock.now())
+        weekday = "一二三四五六日"[local.tm_wday]
+        now_line = f"\n当前时间：{time.strftime('%Y-%m-%d %H:%M', local)} 星期{weekday}。"
+        return base + now_line + ACTION_PROMPT_GUIDE
 
     def _brain_source(self) -> str:
         """当前由谁作答：与 ChatService._brain_source 判据一致（只看 api_key）。"""
@@ -486,7 +494,8 @@ class PetApplication:
             return
         if not attachments:
             # 快速通道：专注番茄钟 / 取消提醒 / 每日提醒 / 一次性提醒，均不进 AI
-            focus_min = parse_focus_command(text)
+            focus_min = parse_focus_command(
+                text, default_min=self._config.focus.default_min)
             if focus_min is not None:
                 self._start_focus(focus_min)
                 return
@@ -585,18 +594,40 @@ class PetApplication:
         self._stats_dialog.show_centered()
 
     def _screenshot_ask(self) -> None:
-        """截图问小墨：抓取全屏 → 作为图片附件打开聊天窗，用户只需输入问题。"""
-        from WisePet.domain.attachment import attachment_from_clipboard_image
-        window = self._window
-        window.hide()
+        """截图问小墨：框选屏幕区域 → 作为图片附件打开聊天窗，用户只需输入问题。
+
+        流程：隐藏宠物和气泡 → 抓全屏快照 → 冻结遮罩上拖拽框选（Esc 取消）→
+        裁剪选区为附件 → 恢复宠物并打开历史窗。只抓主屏画面。
+        """
+        from PySide6.QtCore import QEventLoop
+
+        self._window.hide()
+        self._bubble.hide_bubble()
         self._app.processEvents()
         screen = QGuiApplication.primaryScreen()
-        pixmap = screen.grabWindow(0) if screen is not None else None
-        window.show()
-        if pixmap is None or pixmap.isNull():
+        snapshot = screen.grabWindow(0) if screen is not None else None
+        if snapshot is None or snapshot.isNull():
+            self._window.show()
             self._controller.speak("截屏失败了……再试一次？", source="system")
             return
-        att = attachment_from_clipboard_image(pixmap.toImage())
+
+        loop = QEventLoop()
+        result: dict = {"rect": None}
+        selector = RegionSelector(snapshot, on_done=lambda: self._window.show())
+        selector.selected.connect(lambda rect: (result.__setitem__("rect", rect),
+                                                loop.quit()))
+        selector.cancelled.connect(loop.quit)
+        selector.show()
+        loop.exec()
+        selector.deleteLater()
+        self._window.show()
+
+        rect = result.get("rect")
+        if rect is None:
+            logger.info("screenshot cancelled by user")
+            return
+        cropped = snapshot.copy(rect)
+        att = attachment_from_clipboard_image(cropped.toImage())
         if att is None:
             self._controller.speak("截屏失败了……再试一次？", source="system")
             return

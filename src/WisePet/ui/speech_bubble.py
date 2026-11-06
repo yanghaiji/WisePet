@@ -175,14 +175,19 @@ class SpeechBubble(QWidget):
 
     def begin_stream(self, anchor: QPoint | None = None, title: str = "",
                      on_close: Callable[[], None] | None = None) -> None:
-        """流式回复开始：关掉上一张流卡，建一张空卡避免首包前无反馈。"""
+        """流式回复开始：关掉上一张流卡，建一张空卡避免首包前无反馈。
+
+        兜底计时 = max(60s, 配置时长×2)：即使 end_stream 因异常路径丢失，
+        这张卡也不会永远挂在屏幕上（真机截图踩过）。
+        """
         if self._stream_id is not None:
             self.close_card(self._stream_id)
         self._stream_buffer = []
         self._stream_on_close = on_close
         self._stream_id = self._add_card(
             title or _TITLE_BY_SOURCE.get("ai", "小墨"), "…",
-            with_ack=False, on_ack=None, on_close=on_close, duration_ms=0)
+            with_ack=False, on_ack=None, on_close=on_close,
+            duration_ms=max(60_000, self._duration_ms("", "ai") * 2))
         if anchor is not None:
             self._anchor = anchor
         self._place_and_show()

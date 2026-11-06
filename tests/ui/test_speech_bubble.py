@@ -131,6 +131,29 @@ def should_replace_with_full_reply_when_stream_done(bubble):
     assert bubble.isVisible()
 
 
+def should_follow_unified_duration_when_stream_done(fake_screen, qtbot):
+    """AI 回复卡同样受「弹窗停留」配置约束：统一时长优先于内置表。"""
+    bubble = SpeechBubble(fake_screen, duration_provider=lambda: 7)
+    qtbot.addWidget(bubble)
+    bubble.begin_stream(QPoint(400, 300))
+    bubble.end_stream("完整回复", anchor=QPoint(400, 300))
+
+    remaining = bubble.cards[-1].hide_timer.remainingTime()
+    assert 6_500 <= remaining <= 7_000
+
+
+def should_auto_dismiss_stream_card_when_end_stream_never_arrives(fake_screen, qtbot):
+    """异常路径（如 AI 报错）拿不到 end_stream：兜底计时保证流卡也会消失。"""
+    bubble = SpeechBubble(fake_screen, duration_provider=lambda: 15)
+    qtbot.addWidget(bubble)
+    bubble.begin_stream(QPoint(400, 300))          # 只建卡，永不调 end_stream
+    bubble.cards[-1].hide_timer.start(50)
+
+    qtbot.wait(300)
+
+    assert bubble.cards == [] and not bubble.isVisible()
+
+
 def should_use_durations_by_source(bubble):
     assert DURATION_MS_BY_SOURCE["reminder"] == 15_000   # 未确认 15s 自动消失
     assert bubble._duration_ms("喝水", "reminder") == 15_000
