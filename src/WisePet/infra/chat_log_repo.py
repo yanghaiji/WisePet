@@ -1,5 +1,8 @@
-"""聊天记录仓储：~/.WisePet/chat/YYYY-MM-DD.json，一天一个文件（只追加不截断）。
+"""按天 JSON 聊天记录仓储：旧格式的读取/回退工具，运行时不再装配。
 
+FR v1.22 / NFR v1.23 起，聊天记录统一走 `sqlite_chat_repo.SqliteChatRepository`
+（~/.WisePet/wisepet.db）。保留本类是为了能读回旧 `chat/YYYY-MM-DD.json`、
+留一条可回退路径，并守住原 FR v1.8 的按天文件契约测试。
 复用 `json_store` 的原子写与损坏备份；文件顶层为 dict，符合其载荷契约。
 """
 from __future__ import annotations

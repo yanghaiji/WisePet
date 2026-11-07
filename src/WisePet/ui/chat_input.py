@@ -280,7 +280,7 @@ class ChatInput(QWidget):
         # 文案保持一行放得下（右侧还有「模型」标签 + 下拉），提示语进 tooltip
         suffix = f"  ·  已记 {self._history_count} 条" if self._history_count else ""
         self._status.setText(f"●  {phase}  ·  {brain}{suffix}")
-        self._status.setToolTip("聊天记录按天保存在 ~/.WisePet/chat/；右键宠物 →「历史对话…」回看")
+        self._status.setToolTip("聊天记录存在本机的 ~/.WisePet/wisepet.db；右键宠物 →「历史对话…」回看")
 
     def _emit_active(self, active: bool) -> None:
         if active != self._active:

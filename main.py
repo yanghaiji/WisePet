@@ -43,8 +43,12 @@ from WisePet.app.action_protocol import (                               # noqa: 
     CreateFileAction,
     MakePptAction,
     RemindAction,
+    PERMISSION_AUTO,
+    PERMISSION_DENY,
+    action_preview,
     describe_action,
     is_cancel_reminders_command,
+    permission_required,
     parse_action,
     parse_daily_reminder_command,
     parse_focus_command,
@@ -57,6 +61,8 @@ from WisePet.app.event_bus import EventBus                              # noqa: 
 from WisePet.app.focus_service import FocusLog, FocusService           # noqa: E402
 from WisePet.app.growth_service import GrowthService                    # noqa: E402
 from WisePet.app.local_responder import LocalContext, LocalResponder    # noqa: E402
+from WisePet.app.long_term_memory import LongTermMemory                  # noqa: E402
+from WisePet.app.quiet_budget import QuietBudget                        # noqa: E402
 from WisePet.app.news_service import NewsService                       # noqa: E402
 from WisePet.app.one_shot_reminders import OneShotReminders             # noqa: E402
 from WisePet.app.pet_controller import PetController                   # noqa: E402
@@ -82,18 +88,22 @@ from WisePet.domain.events import (                                    # noqa: E
 )
 from WisePet.domain.config_model import AppConfig                       # noqa: E402
 from WisePet.domain.pet import Pet                                     # noqa: E402
+from WisePet.domain.product import (                                   # noqa: E402
+    BehaviorContext, apply_scene, growth_decoration, is_push_notification,
+    scene_label,
+)
 from WisePet.domain.position import PositionVO                         # noqa: E402
 from WisePet.domain.state_machine import BehaviorState                  # noqa: E402
 from WisePet.domain.errors import AIGatewayError                        # noqa: E402
 from WisePet.domain.vitals import VitalsVO                              # noqa: E402
-from WisePet.infra.chat_log_repo import ChatLogRepository               # noqa: E402
+from WisePet.infra.sqlite_chat_repo import SqliteChatRepository         # noqa: E402
 from WisePet.infra.config_repo import (                               # noqa: E402
     JsonConfigRepository, migrate_legacy_data)
 from WisePet.infra.frame_loader import FrameAssetLoader                # noqa: E402
 from WisePet.infra.global_hotkey import GlobalHotKey                   # noqa: E402
 from WisePet.infra.growth_store import GrowthStore                     # noqa: E402
 from WisePet.infra.instance_guard import InstanceGuard                 # noqa: E402
-from WisePet.infra.logger_setup import setup_logging                   # noqa: E402
+from WisePet.infra.logger_setup import reconfigure_logging, setup_logging  # noqa: E402
 from WisePet.infra.news_feed import fetch_headlines                    # noqa: E402
 from WisePet.infra.platform_util import set_notification_app_id         # noqa: E402
 from WisePet.infra.reminder_store import ReminderStore                 # noqa: E402
@@ -101,9 +111,12 @@ from WisePet.infra.tts import create_synthesizer                       # noqa: E
 from WisePet.infra.weekly_store import WeeklyStore                     # noqa: E402
 from WisePet.infra.openai_client import OpenAICompatClient             # noqa: E402
 from WisePet.infra.ppt_builder import build_ppt                        # noqa: E402
+from WisePet.infra.product_store import MemoryStore, QuietStore         # noqa: E402
 from WisePet.infra.pet_state_repo import PetStateRepository            # noqa: E402
 from WisePet.infra.system_clock import SystemClock                     # noqa: E402
+from WisePet.ui.action_confirm import ActionConfirmDialog               # noqa: E402
 from WisePet.ui.ai_worker import AiWorker                              # noqa: E402
+from WisePet.ui.onboarding_dialog import OnboardingDialog               # noqa: E402
 from WisePet.ui.chat_input import ChatInput                             # noqa: E402
 from WisePet.ui.chat_text_edit import attachment_from_clipboard_image   # noqa: E402
 from WisePet.ui.chat_window import ChatWindow                           # noqa: E402
@@ -148,9 +161,12 @@ class PetApplication:
                  state_repo: PetStateRepository | None = None,
                  assets_dir: Path | str | None = None,
                  clock: SystemClock | None = None,
-                 chat_log_repo: ChatLogRepository | None = None,
-                 tray_available: bool | None = None):
+                 chat_log_repo: SqliteChatRepository | None = None,
+                 tray_available: bool | None = None,
+                 onboarding: bool = False):
         self._app = app
+        # 默认 False：offscreen 组装测试不弹引导；只有真实入口 main() 判定首次运行才打开
+        self._onboarding_enabled = onboarding
         # 宠物藏起来后进程没有任何可见窗口；不关掉这个开关，事件循环会跟着退出
         self._app.setQuitOnLastWindowClosed(False)
         self._config_repo = config_repo or JsonConfigRepository()
@@ -158,10 +174,18 @@ class PetApplication:
         self._clock = clock or SystemClock()
         self._assets_dir = Path(assets_dir) if assets_dir else ROOT / "assets"
         self._config = self._config_repo.load()
-        # 聊天记录与配置同目录（测试注入 tmp_path 时不污染真实用户目录）
-        self._chat_log_repo = chat_log_repo or ChatLogRepository(
+        # 聊天记录改用同目录下的 SQLite 单文件（其余持久化文件仍是 JSON）；
+        # 构造时会把旧 chat/*.json 一次性导入并归档，测试注入 tmp_path 不污染真实目录
+        self._chat_log_repo = chat_log_repo or SqliteChatRepository(
             self._config_repo.path.parent)
         self._chat_history = ChatHistory(self._chat_log_repo)
+        # P1/P2 本地数据：打扰预算计数与长期事实记忆，和配置/聊天记录同目录
+        self._data_dir = self._config_repo.path.parent
+        self._quiet_budget = QuietBudget(QuietStore(self._data_dir), self._clock,
+                                         lambda: self._config)
+        self._memory = LongTermMemory(MemoryStore(self._data_dir),
+                                      lambda: self._config.memory.enabled)
+        self._last_action_receipt: dict | None = None
 
         self._reminder_kind: str | None = None
         self._streaming = False
@@ -178,7 +202,8 @@ class PetApplication:
         self._controller = PetController(
             pet=self._pet, bus=self._bus, clock=self._clock,
             config_provider=lambda: self._config,
-            bounds_provider=lambda: self._screen.bounds_for(PET_SIZE, PET_SIZE))
+            bounds_provider=lambda: self._screen.bounds_for(PET_SIZE, PET_SIZE),
+            context_provider=self._behavior_context)
         self._session = ChatSession(max_turns=self._config.pet.max_turns)
         self._local = LocalResponder(context_provider=self._local_context,
                                      on_remind=self._schedule_remind_action)
@@ -226,7 +251,8 @@ class PetApplication:
                                                         self._config.pet.skin),
                                        size=PET_SIZE, parent=self._app)
         self._window = PetWindow(self._controller, self._animator,
-                                 lambda: self._config, self._screen, size=PET_SIZE)
+                                 lambda: self._config, self._screen, size=PET_SIZE,
+                                 growth_provider=self._growth_decoration)
         self._bubble = SpeechBubble(
             self._screen, duration_provider=lambda: self._config.bubble.duration_s)
         self._chat_input = ChatInput(self._screen,                # 点宠物：正常聊天（单行输入条）
@@ -234,7 +260,8 @@ class PetApplication:
         self._chat_window = ChatWindow(                # 右键：可继续聊的历史窗
             self._screen,
             days_provider=self._chat_history.days,
-            records_provider=self._chat_history.records_for)
+            records_provider=self._chat_history.records_for,
+            search_provider=self._search_chat)
         self._menu = PetMenu(on_settings=self.open_settings,
                              on_feed=self._on_feed,
                              on_pet_head=self._on_pet_head,
@@ -245,8 +272,16 @@ class PetApplication:
                              on_focus=lambda: self._start_focus(
                                  self._config.focus.default_min),
                              on_stats=self._show_stats,
-                             on_screenshot=self._screenshot_ask)
+                             on_screenshot=self._screenshot_ask,
+                             on_scene=self._apply_scene,
+                             on_toggle_mute=self._toggle_mute,
+                             on_undo=self._undo_last_action,
+                             on_onboarding=self._show_onboarding)
         self._stats_dialog = StatsDialog(self._screen)
+        self._onboarding_dialog = OnboardingDialog()
+        self._onboarding_dialog.try_chat.connect(self._show_chat_input)
+        self._onboarding_dialog.try_reminder.connect(self._demo_reminder)
+        self._onboarding_dialog.completed.connect(self._mark_onboarding_done)
         # 无边框 Tool 窗隐藏后没有可右键之处，托盘是唯一还能点的入口（FR v1.11 C21）
         self._tray = PetTrayIcon(self._menu, self._animator.current_frame(),
                                  on_activate=self.toggle_visible, parent=self._app)
@@ -258,11 +293,82 @@ class PetApplication:
             self._menu.act_toggle.setEnabled(False)
             self._menu.act_toggle.setToolTip(HIDE_DISABLED_HINT)
         self._worker = AiWorker(self._chat, parent=self._app)
+        self._menu.set_muted(self._config.quiet.muted)
+        self._menu.set_undo_enabled(self._last_action_receipt is not None)
+        self._memory.hydrate(getattr(self._local, "_engine", None))
 
         self._tick_timer = None          # start() 后才挂，测试可只构建不启动
         self._motion_timer = None        # 同上：只在需要位移推进时短时开启
         self._wire_ui()
         self._wire_events()
+
+    # ---------- P1/P2：引导 / 场景包 / 因果驱动 / 打扰预算 / 长期记忆 ----------
+
+    def _behavior_context(self) -> BehaviorContext | None:
+        """给控制器注入「此刻的生活情境」；关掉因果驱动时返回 None 走原轮播。"""
+        if not self._config.behavior.context_driven:
+            return None
+        return BehaviorContext(
+            hour=time.localtime(self._clock.now()).tm_hour,
+            focusing=bool(getattr(self._focus, "running", False)),
+            quiet=self._config.quiet.muted or self._quiet_deferral() > 0)
+
+    def _growth_decoration(self):
+        """等级 → 可见外观；关掉成长体系时不叠加任何装饰。"""
+        if not self._config.growth.enabled:
+            return growth_decoration(1, enabled=False)
+        return growth_decoration(self._growth.current().level)
+
+    def _search_chat(self, query: str) -> list:
+        if not self._config.memory.enabled:
+            return []
+        return self._chat_history.search(query, self._config.memory.search_max_results)
+
+    def _remember_user_facts(self, text: str) -> None:
+        """用户每说一句都尝试抽取长期事实；有新增才回填本地小脑与落盘。"""
+        if self._memory.learn_from(text):
+            self._memory.hydrate(getattr(self._local, "_engine", None))
+
+    def _apply_scene(self, scene_id: str) -> None:
+        updated = apply_scene(self._config, scene_id)
+        if updated is self._config:
+            return
+        self.apply_config(updated)
+        # 场景包会一次改掉多个开关，只说「换好了」用户根本不知道弹窗为什么消失。
+        quiet = updated.quiet
+        notice = (f"已切到「{scene_label(scene_id)}」："
+                  f"新闻 {'开' if updated.news.enabled else '关'}、"
+                  f"鼓励 {'开' if updated.cheer.enabled else '关'}、"
+                  f"周报 {'开' if updated.weekly.enabled else '关'}；"
+                  f"主动推送每天 {quiet.daily_limit} 条（同类 {quiet.per_source_limit} 条）。")
+        if not (updated.news.enabled or updated.cheer.enabled or updated.weekly.enabled):
+            notice += " 定时推送都关了，弹窗会明显变少；想恢复选「健康作息」。"
+        self._controller.speak(notice, source="system")
+
+    def _toggle_mute(self) -> None:
+        muted = not self._config.quiet.muted
+        self.apply_config(replace(self._config,
+                                  quiet=replace(self._config.quiet, muted=muted)))
+        self._controller.speak("免打扰已经打开，我先安静一会儿。" if muted
+                               else "我回来啦，有提醒还会叫你。", source="system")
+
+    def _onboarding_done(self) -> bool:
+        return (self._data_dir / "onboarding.done").exists()
+
+    def _mark_onboarding_done(self) -> None:
+        try:
+            (self._data_dir / "onboarding.done").write_text("1", encoding="utf-8")
+        except OSError:
+            logger.warning("onboarding marker write failed")
+
+    def _show_onboarding(self) -> None:
+        self._onboarding_dialog.show_centered()
+
+    def _demo_reminder(self) -> None:
+        """引导里的「现场兑现」：真的排一条 1 分钟后的提醒，不是空口说明。"""
+        self._one_shot.schedule(RemindAction(text="喝口水，顺便伸个懒腰吧",
+                                             delay_min=1.0))
+        self._controller.speak("好，1 分钟后我来叫你～", source="system")
 
     # ---------- 生命周期 ----------
 
@@ -303,6 +409,9 @@ class PetApplication:
         logger.info("pet started (assets dir=%s)", self._assets_dir)
         self._log_chat_brain(when="boot")
         self._greet_on_start()   # 每次打开宠物：后台来一句昂扬问候，不拖冷启动
+        if self._onboarding_enabled and not self._onboarding_done():
+            # 延后到出场动画之后，别和开机问候/特效抢这一秒
+            QTimer.singleShot(900, self._show_onboarding)
 
     def shutdown(self) -> None:
         """退出前取消在途请求并落盘状态（PRD US-4 离线恢复）。"""
@@ -405,7 +514,7 @@ class PetApplication:
         local = time.localtime(self._clock.now())
         weekday = "一二三四五六日"[local.tm_wday]
         now_line = f"\n当前时间：{time.strftime('%Y-%m-%d %H:%M', local)} 星期{weekday}。"
-        return base + now_line + ACTION_PROMPT_GUIDE
+        return base + now_line + self._memory.prompt_line() + ACTION_PROMPT_GUIDE
 
     def _brain_source(self) -> str:
         """当前由谁作答：与 ChatService._brain_source 判据一致（只看 api_key）。"""
@@ -553,6 +662,7 @@ class PetApplication:
         if not self._chat.send(text, attachments):
             logger.debug("blank message dropped")
             return
+        self._remember_user_facts(text)   # 长期事实（名字/近况）只落本机
         self._growth.on_chat()   # 真实聊天消息计入成长积分
         self._controller.start_thinking()
         self._sync_window()
@@ -691,6 +801,19 @@ class PetApplication:
                                source="system")
 
     def _on_speak(self, event: SpeakRequestedEvent) -> None:
+        # 打扰预算只拦「程序主动推送」；用户主动发起的回复与工具反馈必须必达
+        push = is_push_notification(event.source, event.title)
+        if not self._quiet_budget.allow(event.source, push=push):
+            # 无声拦截最容易被误读成「弹窗全没了」：当天第一次额度耗尽给一句解释。
+            hint = self._quiet_budget.exhaustion_hint()
+            if hint:
+                self._controller.start_speaking()
+                self._bubble.show_text(
+                    hint, source="system", title="提醒额度",
+                    anchor=self._window.bubble_anchor(),
+                    on_close=self._controller.on_action_finished)
+                self._sync_window()
+            return
         with_ack = event.source == "reminder"
         if not with_ack:
             self._controller.start_speaking()
@@ -744,7 +867,7 @@ class PetApplication:
         logger.info("one-shot reminder scheduled: %s", describe_action(action))
 
     def _handle_action(self, action) -> None:
-        """执行模型返回的操作意图：提醒直接排期；文件/PPT 先弹窗确认再写盘。"""
+        """执行模型返回的操作意图：提醒直接排期；写盘类按权限预览→确认→可撤销。"""
         anchor = self._window.bubble_anchor()
         self._controller.start_speaking()
         if isinstance(action, RemindAction):
@@ -754,22 +877,78 @@ class PetApplication:
                                     on_close=self._controller.on_action_finished)
             self._sync_window()
             return
-        self._bubble.end_stream(f"稍等，我确认一下：{describe_action(action)}",
-                                anchor=anchor,
-                                on_close=self._controller.on_action_finished)
-        self._sync_window()
-        if not self._confirm_action(action):
-            self._controller.speak("好的，先不动文件。", source="system")
+        permission = permission_required(action, self._config.actions.write_permission)
+        if permission == PERMISSION_DENY:
+            self._bubble.end_stream("这个操作被设置挡下了（写盘权限：一律拒绝）",
+                                    anchor=anchor,
+                                    on_close=self._controller.on_action_finished)
+            self._sync_window()
             return
+        if permission != PERMISSION_AUTO:
+            self._bubble.end_stream(f"稍等，我确认一下：{describe_action(action)}",
+                                    anchor=anchor,
+                                    on_close=self._controller.on_action_finished)
+            self._sync_window()
+            approved, remembered = self._confirm_action(action)
+            if not approved:
+                self._controller.speak("好的，先不动文件。", source="system")
+                return
+            if remembered and self._config.actions.remember_allowed:
+                self.apply_config(replace(
+                    self._config,
+                    actions=replace(self._config.actions,
+                                    write_permission=PERMISSION_AUTO)))
+        receipt = self._snapshot_before_write(action)
         try:
             saved = (self._write_file(action)
                      if isinstance(action, CreateFileAction)
                      else build_ppt(action.path, action.title,
                                     [dict(slide) for slide in action.slides]))
-            self._controller.speak(f"搞定啦，文件在这里：{saved}", source="system")
         except OSError as exc:
             logger.warning("action write failed: %s", exc)
             self._controller.speak(f"呜，没写成（{exc}）", source="system")
+            return
+        self._last_action_receipt = receipt
+        self._menu.set_undo_enabled(True)
+        self._controller.speak(f"搞定啦，文件在这里：{saved}（右键可撤销）",
+                               source="system")
+
+    def _snapshot_before_write(self, action) -> dict:
+        """写盘前留一份可还原快照：新文件记「原本不存在」，覆盖写记原始字节。"""
+        path = Path(action.path).expanduser()
+        if path.suffix == "":
+            path = path.with_suffix(".txt")
+        existed = path.exists()
+        raw = None
+        if existed:
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                logger.warning("cannot snapshot existing file: %s", path)
+        return {"path": path, "existed": existed, "raw": raw}
+
+    def _undo_last_action(self) -> None:
+        receipt = self._last_action_receipt
+        if receipt is None:
+            return
+        path: Path = receipt["path"]
+        if receipt["existed"] and receipt["raw"] is None:
+            self._controller.speak("原文件读不出来，我不敢乱动，先不撤销了。",
+                                   source="system")
+            return
+        try:
+            if receipt["existed"]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(receipt["raw"])
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            logger.warning("action undo failed: %s", exc)
+            self._controller.speak(f"呜，撤销没成功（{exc}）", source="system")
+            return
+        self._last_action_receipt = None
+        self._menu.set_undo_enabled(False)
+        self._controller.speak("已经帮你还原啦。", source="system")
 
     def _write_file(self, action: CreateFileAction):
         path = Path(action.path).expanduser()
@@ -780,25 +959,16 @@ class PetApplication:
         logger.info("file written: %s (%d chars)", path, len(action.content))
         return path
 
-    def _confirm_action(self, action) -> bool:
-        """写盘前的用户确认：模型给的路径与内容必须过目（安全闸门）。"""
-        if isinstance(action, CreateFileAction):
-            title, headline = "WisePet 想创建文件", f"创建文件：\n{action.path}"
-            detail = action.content or "（空文件）"
-        else:
-            title, headline = "WisePet 想生成 PPT", f"生成 PPT：\n{action.path}"
-            detail = "\n".join(
-                f"第{i}页 {slide.get('title') or '未命名'}："
-                + "；".join(slide.get('bullets') or ())
-                for i, slide in enumerate(action.slides, 1))
-        box = QMessageBox(self._window)
-        box.setWindowTitle(title)
-        box.setText(headline)
-        box.setDetailedText(detail[:4000])
-        yes = box.addButton("执行", QMessageBox.AcceptRole)
-        box.addButton("先不写", QMessageBox.RejectRole)
-        box.exec()
-        return box.clickedButton() is yes
+    def _confirm_action(self, action) -> tuple[bool, bool]:
+        """写盘前的预览确认：完整内容 + 风险提示 + 可选「以后都允许」。"""
+        is_file = isinstance(action, CreateFileAction)
+        dialog = ActionConfirmDialog(
+            f"创建文件：{action.path}" if is_file else f"生成 PPT：{action.path}",
+            action_preview(action)[:4000], self._window)
+        dialog.setWindowTitle("WisePet 想创建文件" if is_file else "WisePet 想生成 PPT")
+        dialog.set_remember_enabled(self._config.actions.remember_allowed)
+        dialog.exec()
+        return dialog.result_value()
 
     def _generate_cheer(self) -> str | None:
         """鼓励语生成：AI 在线就出一句古诗名句/夸奖；未配置或失败返回 None（走本地语录）。"""
@@ -971,6 +1141,7 @@ class PetApplication:
     def apply_config(self, config: AppConfig) -> None:
         """保存后热生效：配置替换 + 会话上限 + 提醒重新排期 + 皮肤热切换。"""
         previous_skin = self._config.pet.skin
+        previous_system = self._config.system
         self._config = config
         self._config_repo.save(config)
         self._set_chat_state(PHASE_IDLE, self._brain_source())
@@ -987,6 +1158,16 @@ class PetApplication:
         logger.info("config applied: model=%s skin=%s walk=%.0fpx/s",
                     config.ai.model, config.pet.skin, config.pet.walk_speed_px_per_s)
         self._sync_model_combo()
+        self._menu.set_muted(config.quiet.muted)
+        self._menu.set_undo_enabled(self._last_action_receipt is not None)
+        self._memory.hydrate(getattr(self._local, "_engine", None))
+        # 系统配置（日志级别 / 分割阈值 / 保留天数 / 分档）保存后热重建，不用重启
+        if config.system != previous_system:
+            reconfigure_logging(config.system, self._config_repo.path.parent)
+            logger.info("system log settings applied: level=%s max_mb=%s retention=%s split=%s",
+                        config.system.log_level, config.system.log_max_mb,
+                        config.system.log_retention_days,
+                        config.system.log_split_by_level)
         self._log_chat_brain(when="config-saved")
 
     # ---------- 多模型方案 ----------
@@ -1112,12 +1293,16 @@ def main() -> int:
         return 1
 
     migrated = migrate_legacy_data()
-    log_file = setup_logging()
+    # 日志装配要先读到「系统配置」分区里的级别/阈值/保留期，再挂 handler
+    boot_config = JsonConfigRepository().load()
+    log_file = setup_logging(system=boot_config.system)
     logger.info("bootstrapping (log=%s)", log_file)
     if migrated:
         logger.info("legacy data migrated from ~/.ai-bot: %s", migrated)
 
-    pet_app = PetApplication(app)
+    # 首次运行判定放在真实入口：组装测试构造 PetApplication 时 onboarding 默认 False
+    onboarding = not (JsonConfigRepository().path.parent / "onboarding.done").exists()
+    pet_app = PetApplication(app, onboarding=onboarding)
     app.aboutToQuit.connect(pet_app.shutdown)
     pet_app.start()
     logger.info("cold start took %.2fs (target <3s)", time.monotonic() - started_at)

@@ -6,6 +6,8 @@ from typing import Callable
 
 from PySide6.QtWidgets import QMenu, QWidget
 
+from ..domain.product import scene_description, scene_ids, scene_label
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,7 +21,11 @@ class PetMenu(QMenu):
                  on_history: Callable[[], None] | None = None,
                  on_focus: Callable[[], None] | None = None,
                  on_stats: Callable[[], None] | None = None,
-                 on_screenshot: Callable[[], None] | None = None):
+                 on_screenshot: Callable[[], None] | None = None,
+                 on_scene: Callable[[str], None] | None = None,
+                 on_toggle_mute: Callable[[], None] | None = None,
+                 on_undo: Callable[[], None] | None = None,
+                 on_onboarding: Callable[[], None] | None = None):
         super().__init__(parent)
         self.setStyleSheet(
             "QMenu{background:#FFFDF7;border:1px solid #E2CFAF;border-radius:10px;"
@@ -39,6 +45,23 @@ class PetMenu(QMenu):
         # 帧图按路径缓存在内存里，换素材后不重启看不到新图，所以留一个重载入口
         self.act_reload = self.addAction("重新加载素材")
         self.addSeparator()
+        # P1/P2：一键场景包 / 免打扰 / 撤销写盘 / 重看引导
+        self.scenes_menu = self.addMenu("一键场景包")
+        self.scenes_menu.setEnabled(on_scene is not None)
+        self.scene_actions = {}
+        for scene in scene_ids():
+            action = self.scenes_menu.addAction(scene_label(scene))
+            action.setToolTip(scene_description(scene))
+            if on_scene is not None:
+                action.triggered.connect(
+                    lambda _checked=False, s=scene: on_scene(s))
+            self.scene_actions[scene] = action
+        self.act_mute = self.addAction("免打扰：关")
+        self.act_mute.setCheckable(True)
+        self.act_undo = self.addAction("撤销上一次写文件")
+        self.act_undo.setEnabled(False)
+        self.act_onboarding = self.addAction("再看一次新手引导")
+        self.addSeparator()
         self.act_toggle = self.addAction("隐藏宠物")
         self.act_quit = self.addAction("退出")
 
@@ -57,7 +80,10 @@ class PetMenu(QMenu):
             self.act_reload.setEnabled(False)
         for action, callback in ((self.act_focus, on_focus),
                                  (self.act_stats, on_stats),
-                                 (self.act_screenshot, on_screenshot)):
+                                 (self.act_screenshot, on_screenshot),
+                                 (self.act_mute, on_toggle_mute),
+                                 (self.act_undo, on_undo),
+                                 (self.act_onboarding, on_onboarding)):
             if callback is not None:
                 action.triggered.connect(callback)
             else:
@@ -66,3 +92,13 @@ class PetMenu(QMenu):
     def set_hidden_state(self, hidden: bool) -> None:
         """菜单文案跟随当前可见性（「隐藏/显示宠物」）。"""
         self.act_toggle.setText("显示宠物" if hidden else "隐藏宠物")
+
+    def set_muted(self, muted: bool) -> None:
+        """免打扰开关的勾选与文案同步（不触发 triggered，避免回调自激）。"""
+        self.act_mute.blockSignals(True)
+        self.act_mute.setChecked(muted)
+        self.act_mute.setText(f"免打扰：{'开' if muted else '关'}")
+        self.act_mute.blockSignals(False)
+
+    def set_undo_enabled(self, enabled: bool) -> None:
+        self.act_undo.setEnabled(enabled)

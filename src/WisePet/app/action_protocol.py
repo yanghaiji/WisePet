@@ -259,6 +259,42 @@ def describe_action(action: Action) -> str:
     return f"生成 PPT「{action.title}」（{len(action.slides)} 页：{slides}{more}）"
 
 
+#: 写盘类意图的权限级别（与 ActionSettings.write_permission 同口径）
+PERMISSION_AUTO = "auto"
+PERMISSION_CONFIRM = "confirm"
+PERMISSION_DENY = "deny"
+
+
+def action_kind(action: Action) -> str:
+    if isinstance(action, RemindAction):
+        return ACTION_REMIND
+    if isinstance(action, CreateFileAction):
+        return ACTION_CREATE_FILE
+    return ACTION_MAKE_PPT
+
+
+def permission_required(action: Action, setting: str = PERMISSION_CONFIRM) -> str:
+    """权限分级：定时提醒不写盘故恒为 auto；写盘类按配置，非法配置保守回 confirm。"""
+    if isinstance(action, RemindAction):
+        return PERMISSION_AUTO
+    value = str(setting or "").strip().lower()
+    return (value if value in (PERMISSION_AUTO, PERMISSION_CONFIRM, PERMISSION_DENY)
+            else PERMISSION_CONFIRM)
+
+
+def action_preview(action: Action) -> str:
+    """执行前的完整预览：目标路径 + 将被写入的正文（写盘类专用）。"""
+    if isinstance(action, CreateFileAction):
+        return f"目标：{action.path}\n\n将写入的内容：\n{action.content or '（空文件）'}"
+    if isinstance(action, MakePptAction):
+        lines = [f"目标：{action.path}", f"标题：{action.title}", ""]
+        for idx, slide in enumerate(action.slides, 1):
+            bullets = "；".join(str(b) for b in (slide.get("bullets") or ()))
+            lines.append(f"第{idx}页 {slide.get('title') or '未命名'}：{bullets}")
+        return "\n".join(lines)
+    return describe_action(action)
+
+
 def _pretty_delay(delay_min: float) -> str:
     if delay_min >= 60 and delay_min % 60 == 0:
         return f"{int(delay_min // 60)}小时"

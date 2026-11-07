@@ -1,7 +1,7 @@
 """组装根冒烟：装配顺序、恢复/落盘、事件到控件的闭环（技术方案 §4 / §9 Step 6）。"""
 from __future__ import annotations
 
-import json
+
 import logging
 from dataclasses import replace
 
@@ -328,16 +328,15 @@ class TestChatEntryPoints:
 
 
 class TestChatSessionLifecycle:
-    """FR v1.8 C13/C14：会话状态可见、按天落盘、重开恢复、对话中不动。"""
+    """FR v1.8 C13/C14：会话状态可见、按天入库、重开恢复、对话中不动。"""
 
-    def should_persist_turn_and_show_thinking_when_message_sent(self, pet_app, tmp_path):
+    def should_persist_turn_and_show_thinking_when_message_sent(self, pet_app):
         pet_app.send_message("今天怎么样")
 
-        day_file = tmp_path / "chat" / f"{day_key()}.json"
-        assert day_file.exists()
-        data = json.loads(day_file.read_text(encoding="utf-8"))
-        assert data["records"][0]["content"] == "今天怎么样"
-        assert data["records"][0]["role"] == "user"
+        records = pet_app._chat_log_repo.load(day_key())
+        assert len(records) == 1
+        assert records[0].content == "今天怎么样"
+        assert records[0].role == "user"
         assert "你好" not in pet_app._chat_window.status_text  # 状态栏不是历史区
         assert "思考中" in pet_app._chat_window.status_text
         assert "本地小脑" in pet_app._chat_window.status_text
@@ -346,15 +345,13 @@ class TestChatSessionLifecycle:
         assert "本地小脑" in pet_app._chat_input.status_text
         assert "今天怎么样" in pet_app._chat_window._history.toPlainText()
 
-    def should_persist_assistant_turn_and_done_state_when_reply_finished(self, pet_app,
-                                                                          tmp_path):
+    def should_persist_assistant_turn_and_done_state_when_reply_finished(self, pet_app):
         pet_app.send_message("你好呀")
         pet_app._chat.process_next()
 
-        data = json.loads((tmp_path / "chat" / f"{day_key()}.json")
-                          .read_text(encoding="utf-8"))
-        assert [r["role"] for r in data["records"]] == ["user", "assistant"]
-        assert data["records"][1]["source"] == "local"
+        records = pet_app._chat_log_repo.load(day_key())
+        assert [r.role for r in records] == ["user", "assistant"]
+        assert records[1].source == "local"
         assert "回复完成" in pet_app._chat_window.status_text
 
     def should_show_error_state_when_gateway_fails(self, pet_app):
@@ -407,14 +404,13 @@ class TestChatSessionLifecycle:
         qtbot.addWidget(first.window)
         first.send_message("一句话")
         first.shutdown()
-        day_file = tmp_path / "chat" / f"{day_key()}.json"
-        assert len(json.loads(day_file.read_text(encoding="utf-8"))["records"]) == 1
+        assert first._chat_log_repo.count() == 1
 
         second = _build(qapp, tmp_path, assets_dir)
         qtbot.addWidget(second.window)
         try:
             second.start()
-            assert len(json.loads(day_file.read_text(encoding="utf-8"))["records"]) == 1
+            assert second._chat_log_repo.count() == 1
         finally:
             second.shutdown()
 

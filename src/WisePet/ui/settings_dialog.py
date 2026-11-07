@@ -122,6 +122,7 @@ QCheckBox::indicator {
     border-radius: 4px; background: #FFFFFF;
 }
 QCheckBox::indicator:checked { background: #F8D79B; border: 1px solid #E8A45C; }
+QLabel#sectionNote { color: #A08A6C; font-size: 11px; }
 /* 微调按钮改成自绘的贴纸风图标按钮（见 _StickerSteppers）。
    QSS 的 ::up-arrow border 三角形会被 Qt 渲染成深色实心方块，实在太丑，弃用。 */
 QSpinBox, QDoubleSpinBox {
@@ -327,6 +328,8 @@ class SettingsDialog(QDialog):
         body.addWidget(self._build_pet_group(content))
         body.addWidget(self._build_reminder_group(content))
         body.addWidget(self._build_companion_group(content))
+        body.addWidget(self._build_experience_group(content))
+        body.addWidget(self._build_system_group(content))
         body.addStretch(1)
         self._scroll.setWidget(content)
 
@@ -369,8 +372,12 @@ class SettingsDialog(QDialog):
                          self._idle_min, self._idle_max, self._max_turns,
                          self._chat_idle_hide,
                          self._tts_volume, self._tts_rate, self._weekly_hour,
-                         self._water_interval, self._sedentary_interval)
-        for widget in value_widgets + (self._skin, self._weekly_weekday):
+                         self._water_interval, self._sedentary_interval,
+                         self._quiet_daily, self._quiet_per_source,
+                         self._memory_search_limit,
+                         self._log_max_mb, self._log_retention)
+        for widget in value_widgets + (self._skin, self._weekly_weekday,
+                                       self._action_permission, self._log_level):
             widget.wheel_target = self._scroll.viewport()
         for widget in value_widgets:
             # 上一轮把滚轮改成「只滚页面」、微调按钮又做成透明，用户以为没法输入。
@@ -646,6 +653,60 @@ class SettingsDialog(QDialog):
         form.addRow("成长体系", self._growth_enabled)
         return box
 
+    def _build_experience_group(self, parent: QWidget) -> QFrame:
+        """体验与隐私：打扰预算 / 行为因果 / 长期记忆 / 写盘权限（P1+P2 的开关面）。"""
+        box, form = self._section(parent, "体验与隐私")
+        self._quiet_enabled = QCheckBox("打扰预算（限制程序主动推送的每日条数）", box)
+        self._quiet_daily = _int_spin(1, 200, 12, " 条/天", box)
+        self._quiet_per_source = _int_spin(1, 100, 4, " 条/天", box)
+        self._quiet_muted = QCheckBox("一键免打扰（暂停全部主动推送）", box)
+        self._quiet_muted.setToolTip("用户主动发起的聊天回复与工具执行反馈不受影响")
+        form.addRow("预算开关", self._quiet_enabled)
+        form.addRow("每日上限", self._quiet_daily)
+        form.addRow("单来源上限", self._quiet_per_source)
+        form.addRow("免打扰", self._quiet_muted)
+        self._behavior_context = QCheckBox(
+            "按当前时段 / 专注 / 勿扰决定动作（而不是纯随机轮播）", box)
+        form.addRow("行为驱动", self._behavior_context)
+        self._memory_enabled = QCheckBox("长期记忆（记住名字与近况，只存本机）", box)
+        self._memory_search_limit = _int_spin(5, 500, 50, " 条", box)
+        form.addRow("长期记忆", self._memory_enabled)
+        form.addRow("检索上限", self._memory_search_limit)
+        self._action_permission = _NoWheelComboBox(box)
+        for label, value in (("每次确认（推荐）", "confirm"),
+                             ("始终允许", "auto"), ("一律拒绝", "deny")):
+            self._action_permission.addItem(label, value)
+        self._action_permission.setToolTip("控制模型发起的创建文件 / 生成 PPT 这类写盘操作")
+        self._action_remember = QCheckBox("允许在确认框里记住「以后都允许」", box)
+        form.addRow("写盘权限", self._action_permission)
+        form.addRow("记住授权", self._action_remember)
+        return box
+
+    def _build_system_group(self, parent: QWidget) -> QFrame:
+        """系统配置：与宠物本身无关的运行参数（当前是日志治理四项）。"""
+        box, form = self._section(parent, "系统配置")
+        self._log_level = _NoWheelComboBox(box)
+        for label, value in (("详细（DEBUG）", "debug"),
+                             ("常规（INFO，推荐）", "info"),
+                             ("仅告警（WARNING）", "warning"),
+                             ("仅错误（ERROR）", "error")):
+            self._log_level.addItem(label, value)
+        self._log_max_mb = _int_spin(1, 100, 10, " MiB", box)
+        self._log_max_mb.setToolTip("单个日志文件超过这个值就分割")
+        self._log_retention = _int_spin(1, 30, 3, " 天", box)
+        self._log_retention.setToolTip("滚动备份只保留近 N 天，正在写的文件不动")
+        self._log_split = QCheckBox("告警与错误另存一份 WisePet-error.log", box)
+        form.addRow("日志级别", self._log_level)
+        form.addRow("单文件上限", self._log_max_mb)
+        form.addRow("保留天数", self._log_retention)
+        form.addRow("日志分档", self._log_split)
+        note = QLabel("保存后立即生效，无需重启；设置放在 ~/.WisePet/config.json 的 system 分节。",
+                      box)
+        note.setWordWrap(True)
+        note.setObjectName("sectionNote")
+        form.addRow("", note)
+        return box
+
     # ---------- 取值 / 回填 ----------
 
     def _load_from(self, cfg: AppConfig) -> None:
@@ -709,6 +770,37 @@ class SettingsDialog(QDialog):
         self._weekly_hour.setValue(int(weekly.hour) if weekly is not None else 20)
         growth = getattr(cfg, "growth", None)
         self._growth_enabled.setChecked(growth.enabled if growth is not None else True)
+        quiet = getattr(cfg, "quiet", None)
+        self._quiet_enabled.setChecked(quiet.enabled if quiet is not None else True)
+        self._quiet_daily.setValue(int(quiet.daily_limit) if quiet is not None else 12)
+        self._quiet_per_source.setValue(
+            int(quiet.per_source_limit) if quiet is not None else 4)
+        self._quiet_muted.setChecked(quiet.muted if quiet is not None else False)
+        behavior = getattr(cfg, "behavior", None)
+        self._behavior_context.setChecked(
+            behavior.context_driven if behavior is not None else True)
+        memory = getattr(cfg, "memory", None)
+        self._memory_enabled.setChecked(memory.enabled if memory is not None else True)
+        self._memory_search_limit.setValue(
+            int(memory.search_max_results) if memory is not None else 50)
+        actions = getattr(cfg, "actions", None)
+        pidx = self._action_permission.findData(
+            actions.write_permission if actions is not None else "confirm")
+        if pidx >= 0:
+            self._action_permission.setCurrentIndex(pidx)
+        self._action_remember.setChecked(
+            actions.remember_allowed if actions is not None else False)
+        system = getattr(cfg, "system", None)
+        level_index = self._log_level.findData(
+            system.log_level if system is not None else "info")
+        if level_index >= 0:
+            self._log_level.setCurrentIndex(level_index)
+        self._log_max_mb.setValue(
+            int(system.log_max_mb) if system is not None else 10)
+        self._log_retention.setValue(
+            int(system.log_retention_days) if system is not None else 3)
+        self._log_split.setChecked(
+            system.log_split_by_level if system is not None else True)
         self._sync_reminder_labels()
 
     def _sync_reminder_labels(self) -> None:
@@ -785,11 +877,32 @@ class SettingsDialog(QDialog):
                          hour=int(self._weekly_hour.value()))
         growth = replace(self._base.growth,
                          enabled=self._growth_enabled.isChecked())
+        quiet = replace(self._base.quiet,
+                        enabled=self._quiet_enabled.isChecked(),
+                        daily_limit=int(self._quiet_daily.value()),
+                        per_source_limit=int(self._quiet_per_source.value()),
+                        muted=self._quiet_muted.isChecked())
+        behavior = replace(self._base.behavior,
+                           context_driven=self._behavior_context.isChecked())
+        memory = replace(self._base.memory,
+                         enabled=self._memory_enabled.isChecked(),
+                         search_max_results=int(self._memory_search_limit.value()))
+        actions = replace(self._base.actions,
+                          write_permission=self._action_permission.currentData()
+                          or "confirm",
+                          remember_allowed=self._action_remember.isChecked())
+        system = replace(self._base.system,
+                         log_level=self._log_level.currentData() or "info",
+                         log_max_mb=int(self._log_max_mb.value()),
+                         log_retention_days=int(self._log_retention.value()),
+                         log_split_by_level=self._log_split.isChecked())
         return AppConfig(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                          vitals=self._base.vitals, reminders=reminders,
                          news=news, cheer=cheer, bubble=bubble, chat=chat,
                          focus=focus, dnd=dnd, tts=tts, notification=notification,
-                         weekly=weekly, growth=growth), ""
+                         weekly=weekly, growth=growth, quiet=quiet,
+                         behavior=behavior, memory=memory, actions=actions,
+                         system=system), ""
 
     def _match_active_profile(self, cfg: AppConfig) -> str:
         """当前生效 ai 对应的方案名；找不到就用第一个方案。"""

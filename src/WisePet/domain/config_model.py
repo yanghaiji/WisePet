@@ -144,6 +144,52 @@ class GrowthSettings:
 
 
 @dataclass
+class QuietBudgetSettings:
+    """打扰预算：主动推送每日总量 / 单来源上限 + 一键免打扰。
+
+    只管主动推送（提醒/新闻/鼓励/周报/成长/专注/问候）；用户主动发起的
+    聊天回复与工具执行反馈不受预算拦截，否则「问了却没回」会被误当成 bug。
+    """
+    enabled: bool = True
+    daily_limit: int = 12
+    per_source_limit: int = 4
+    muted: bool = False
+
+
+@dataclass
+class BehaviorSettings:
+    """行为因果驱动：按当前时段 / 专注 / 勿扰选动作，而不是纯随机轮播。"""
+    context_driven: bool = True
+
+
+@dataclass
+class MemorySettings:
+    """长期记忆与跨日检索：只落本机，不上传（隐私卖点的护城河）。"""
+    enabled: bool = True
+    search_max_results: int = 50
+
+
+@dataclass
+class ActionSettings:
+    """写盘类意图的权限级别：auto 直接执行 / confirm 每次确认 / deny 一律拒绝。"""
+    write_permission: str = "confirm"
+    remember_allowed: bool = False
+
+
+@dataclass
+class SystemSettings:
+    """系统配置：与宠物本身无关的运行时参数，集中在设置窗「系统配置」分区。
+
+    日志级别 / 单文件分割阈值 / 备份保留天数 / 是否另存错误档；
+    保存后立即热重建日志 handler，不用重启桌宠。
+    """
+    log_level: str = "info"          # debug / info / warning / error
+    log_max_mb: int = 10             # 单文件上限，MiB
+    log_retention_days: int = 3      # 滚动备份保留天数
+    log_split_by_level: bool = True  # 是否另存 WARNING+ 错误档
+
+
+@dataclass
 class FocusSettings:
     """番茄钟：默认专注时长，一句话（「来个番茄钟」）与右键菜单都取这个值。"""
     default_min: float = 25.0
@@ -183,6 +229,11 @@ class AppConfig:
     notification: NotificationSettings = field(default_factory=NotificationSettings)
     weekly: WeeklySettings = field(default_factory=WeeklySettings)
     growth: GrowthSettings = field(default_factory=GrowthSettings)
+    quiet: QuietBudgetSettings = field(default_factory=QuietBudgetSettings)
+    behavior: BehaviorSettings = field(default_factory=BehaviorSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
+    actions: ActionSettings = field(default_factory=ActionSettings)
+    system: SystemSettings = field(default_factory=SystemSettings)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -315,10 +366,49 @@ class AppConfig:
         growth = GrowthSettings(
             enabled=_bool(g_d.get("enabled"), defaults.growth.enabled),
         )
+        q_d = data.get("quiet") or {}
+        quiet = QuietBudgetSettings(
+            enabled=_bool(q_d.get("enabled"), defaults.quiet.enabled),
+            daily_limit=_int_clamp(q_d.get("daily_limit"), defaults.quiet.daily_limit, 1, 200),
+            per_source_limit=_int_clamp(q_d.get("per_source_limit"),
+                                        defaults.quiet.per_source_limit, 1, 100),
+            muted=_bool(q_d.get("muted"), defaults.quiet.muted),
+        )
+        b_d = data.get("behavior") or {}
+        behavior = BehaviorSettings(
+            context_driven=_bool(b_d.get("context_driven"), defaults.behavior.context_driven),
+        )
+        m_d = data.get("memory") or {}
+        memory = MemorySettings(
+            enabled=_bool(m_d.get("enabled"), defaults.memory.enabled),
+            search_max_results=_int_clamp(m_d.get("search_max_results"),
+                                          defaults.memory.search_max_results, 5, 500),
+        )
+        a_d = data.get("actions") or {}
+        actions = ActionSettings(
+            write_permission=_choice(a_d.get("write_permission"),
+                                     defaults.actions.write_permission,
+                                     ("auto", "confirm", "deny")),
+            remember_allowed=_bool(a_d.get("remember_allowed"),
+                                   defaults.actions.remember_allowed),
+        )
+        s_d = data.get("system") or {}
+        system = SystemSettings(
+            log_level=_choice(s_d.get("log_level"), defaults.system.log_level,
+                              ("debug", "info", "warning", "error")),
+            log_max_mb=_int_clamp(s_d.get("log_max_mb"),
+                                  defaults.system.log_max_mb, 1, 100),
+            log_retention_days=_int_clamp(s_d.get("log_retention_days"),
+                                          defaults.system.log_retention_days, 1, 30),
+            log_split_by_level=_bool(s_d.get("log_split_by_level"),
+                                     defaults.system.log_split_by_level),
+        )
         return cls(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                    vitals=vitals, reminders=reminders, news=news, cheer=cheer,
                    bubble=bubble, chat=chat, focus=focus, dnd=dnd,
-                   tts=tts, notification=notification, weekly=weekly, growth=growth)
+                   tts=tts, notification=notification, weekly=weekly, growth=growth,
+                   quiet=quiet, behavior=behavior, memory=memory, actions=actions,
+                   system=system)
 
 
 def _parse_profiles(raw, ai: AIConfig) -> list:
@@ -364,3 +454,9 @@ def _bool(raw, fallback: bool) -> bool:
 def _int_clamp(raw, fallback: int, lo: int, hi: int) -> int:
     """整数配置：非法值回默认，越界钳到 [lo, hi]（手改 json 写超范围也不会失控）。"""
     return min(hi, max(lo, int(_num(raw, fallback))))
+
+
+def _choice(raw, fallback: str, allowed: tuple[str, ...]) -> str:
+    """枚举配置：手改 json 写了白名单外的值一律回默认，避免出现无处理分支。"""
+    value = str(raw or "").strip().lower()
+    return value if value in allowed else fallback

@@ -849,6 +849,41 @@ class TestShowcaseCoverage:
         assert NAP_MIN_DURATION_S >= 10.0
 
 
+class TestContextDrivenBehavior:
+    """P1「有因果的行为」：注入生活情境后，非轮播那一次触发按情境选动作。"""
+
+    def should_stay_calm_while_focusing_or_in_quiet_hours(self):
+        from WisePet.domain.product import BehaviorContext
+
+        ctx = make_ctx(idle_s=0.0)
+        controller = ctx["controller"]
+        controller._context = lambda: BehaviorContext(hour=14, focusing=True)
+        controller._maybe_autonomous_action(ctx["clock"].now(), ctx["cfg"], False)
+        assert ctx["pet"].state is BehaviorState.IDLE
+
+    def should_stretch_in_the_morning(self):
+        from WisePet.domain.product import BehaviorContext
+
+        ctx = make_ctx(idle_s=0.0)
+        controller = ctx["controller"]
+        controller._context = lambda: BehaviorContext(hour=8)
+        controller._maybe_autonomous_action(ctx["clock"].now(), ctx["cfg"], False)
+        assert ctx["pet"].state is BehaviorState.STRETCHING
+
+    def should_keep_showcase_rotation_when_context_has_no_hint(self):
+        from WisePet.domain.product import BehaviorContext
+        from WisePet.app.pet_controller import SHOWCASE_STATES
+
+        ctx = make_ctx(idle_s=0.0)
+        controller = ctx["controller"]
+        controller._context = lambda: BehaviorContext(hour=14)
+        now = ctx["clock"].now()
+        controller._maybe_autonomous_action(now, ctx["cfg"], False)
+        ctx["pet"].stop_walk()
+        controller._maybe_autonomous_action(now, ctx["cfg"], False)
+        assert ctx["pet"].state is SHOWCASE_STATES[0]
+
+
 class TestMotionTick:
     def should_advance_position_without_vitals_or_behavior_events(self):
         """tick_motion 只推位移：不驱动衰减/自主行为，免得高频通道干扰它们。"""

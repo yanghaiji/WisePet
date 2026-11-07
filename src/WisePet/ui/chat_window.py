@@ -13,7 +13,7 @@ from typing import Callable
 from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
@@ -30,6 +30,21 @@ logger = logging.getLogger(__name__)
 _WINDOW_WIDTH = 440
 _WINDOW_HEIGHT = 500
 _WINDOW_MIN_WIDTH = 300
+
+#: 跨日全文检索的搜索行，与卡片同源配色（单独拼接，不动主样式表）
+_SEARCH_STYLE = """
+QLineEdit#search {
+    background: #FFFFFF; border: 1px solid #E7D3B2; border-radius: 9px;
+    padding: 6px 10px; color: #3A2B21; font-size: 12px;
+    selection-background-color: #F3D9A8;
+}
+QLineEdit#search:focus { border: 1px solid #E8A45C; }
+QPushButton#searchBtn {
+    background: #FFF3DE; border: 1px solid #E8C89B; border-radius: 9px;
+    color: #6B4F3A; font-size: 12px; padding: 6px 12px;
+}
+QPushButton#searchBtn:hover { background: #F8D79B; }
+"""
 
 #: 会话阶段 → 用户可读文案；错误另拼 detail
 _PHASE_TEXT = {
@@ -145,11 +160,15 @@ class ChatWindow(QWidget):
     def __init__(self, screen_bounds: ScreenBounds | None = None,
                  parent: QWidget | None = None,
                  days_provider: Callable[[], list[str]] | None = None,
-                 records_provider: Callable[[str], list] | None = None):
+                 records_provider: Callable[[str], list] | None = None,
+                 search_provider: Callable[[str], list] | None = None):
         super().__init__(parent)
         self._screen = screen_bounds
         self._days_provider = days_provider or (lambda: [day_key()])
         self._records_provider = records_provider or (lambda _day: [])
+        self._search_provider = search_provider or (lambda _query: [])
+        self._searching = False
+        self._search_results: list = []
         self._active = False
         self._phase = PHASE_IDLE
         self._brain = ""
@@ -167,7 +186,7 @@ class ChatWindow(QWidget):
         # 不固定宽度：宠物在窄工作区中间时要能缩到「较宽那侧」放得下
         self.setMinimumWidth(_WINDOW_MIN_WIDTH)
         self.resize(_WINDOW_WIDTH, _WINDOW_HEIGHT)
-        self.setStyleSheet(_STYLE)
+        self.setStyleSheet(_STYLE + _SEARCH_STYLE)
 
         card = QFrame(self)
         card.setObjectName("historyCard")
@@ -216,6 +235,20 @@ class ChatWindow(QWidget):
         status_row.setContentsMargins(16, 0, 16, 10)
         status_row.addWidget(self._status, 1)
 
+        self._search_edit = QLineEdit(card)
+        self._search_edit.setObjectName("search")
+        self._search_edit.setPlaceholderText("搜索全部聊天记录（回车；清空回到当天）")
+        self._search_edit.returnPressed.connect(self._on_search)
+        self._search_btn = QPushButton("搜索", card)
+        self._search_btn.setObjectName("searchBtn")
+        self._search_btn.setCursor(Qt.PointingHandCursor)
+        self._search_btn.clicked.connect(self._on_search)
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(16, 0, 16, 8)
+        search_row.setSpacing(8)
+        search_row.addWidget(self._search_edit, 1)
+        search_row.addWidget(self._search_btn)
+
         self._history = QTextBrowser(card)
         self._history.setReadOnly(True)
         self._history.setOpenExternalLinks(False)
@@ -244,7 +277,7 @@ class ChatWindow(QWidget):
         input_row.addWidget(self._edit, 1)
         input_row.addWidget(self._attach_btn, 0, Qt.AlignBottom)
         input_row.addWidget(self._send_btn)
-        hint = QLabel("记录按天保存在 ~/.WisePet/chat/ · 只存在本机", card)
+        hint = QLabel("记录存在本机的 ~/.WisePet/wisepet.db · 绝不上传", card)
         hint.setObjectName("hint")
 
         body = QVBoxLayout(card)
@@ -252,6 +285,7 @@ class ChatWindow(QWidget):
         body.setSpacing(0)
         body.addLayout(head)
         body.addLayout(status_row)
+        body.addLayout(search_row)
         body.addWidget(self._history, 1)
         body.addWidget(self._files)
         body.addLayout(input_row)
@@ -405,8 +439,35 @@ class ChatWindow(QWidget):
 
         旧日期视图被切回当天时会 reload，重新从仓储读全量，不会丢消息。
         """
+        if self._searching:
+            return                      # 搜索结果视图不被新消息冲掉
         if self.session_day == day_key():
             self.append_record(record)
+
+    def search(self, query: str) -> list:
+        """跨日检索并渲染命中；空查询退出搜索态、回到所选日期。"""
+        needle = str(query or "").strip()
+        if not needle:
+            self._searching = False
+            self._search_results = []
+            self._load_day(self.session_day)
+            return []
+        self._search_results = list(self._search_provider(needle))
+        self._searching = True
+        self.load_history(self._search_results)
+        self._refresh_status()
+        return list(self._search_results)
+
+    def _on_search(self) -> None:
+        self.search(self._search_edit.text())
+
+    @property
+    def search_input(self) -> QLineEdit:
+        return self._search_edit
+
+    @property
+    def searching(self) -> bool:
+        return self._searching
 
     def set_state(self, phase: str, source: str = "", detail: str = "") -> None:
         """会话阶段 + 大脑来源：调用大模型时能看到现在处于哪一步。"""
@@ -464,8 +525,11 @@ class ChatWindow(QWidget):
         if self._phase == PHASE_ERROR and self._detail:
             phase = f"{phase}（{self._detail}）"
         brain = _BRAIN_TEXT.get(self._brain, self._brain)
-        self._status.setText(f"会话 {self.session_day or day_key()} · {self._count} 条"
-                             f" ｜ {phase} ｜ 大脑：{brain}")
+        if self._searching:
+            head = f"搜索「{self._search_edit.text().strip()}」· {self._count} 条命中"
+        else:
+            head = f"会话 {self.session_day or day_key()} · {self._count} 条"
+        self._status.setText(f"{head} ｜ {phase} ｜ 大脑：{brain}")
 
     def _load_day(self, day: str) -> None:
         if not day:

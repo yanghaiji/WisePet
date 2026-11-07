@@ -41,3 +41,24 @@ class ChatHistory:
         for day in self._store.days()[-max_days:]:
             records.extend(self._store.load(day))
         return sorted(records, key=lambda r: r.ts or 0.0)
+
+    def search(self, query: str, limit: int = 50) -> list[ChatRecord]:
+        """跨日全文检索：子串大小写不敏感，按时间倒序返回最近 limit 条。
+
+        全程读本机按天文件，不建索引、不上传；空查询返回空列表，避免
+        一打开搜索就把整份历史刷上屏。
+        """
+        needle = str(query or "").strip().lower()
+        if not needle or limit <= 0:
+            return []
+        # SQLite 仓储自带一次 SQL 的检索；旧的内存/JSON 替身没有该方法，
+        # 回退到原来的全量遍历，保证既有测试与回退路径行为不变。
+        delegate = getattr(self._store, "search", None)
+        if delegate is not None:
+            return list(delegate(needle, limit))
+        hits: list[ChatRecord] = []
+        for day in reversed(self._store.days()):
+            for record in self._store.load(day):
+                if needle in str(record.content or "").lower():
+                    hits.append(record)
+        return sorted(hits, key=lambda r: r.ts or 0.0, reverse=True)[:limit]

@@ -308,12 +308,13 @@ class TestStickerStyle:
 
         assert not dialog.isVisible()
 
-    def should_keep_five_sections_in_scrollable_card(self, qtbot, base_config):
+    def should_keep_seven_sections_in_scrollable_card(self, qtbot, base_config):
         dialog = SettingsDialog(base_config)
         qtbot.addWidget(dialog)
 
         assert dialog._scroll.widgetResizable()
-        assert len(dialog.findChildren(QFrame, "section")) == 5
+        # 5 个业务分区 + 「体验与隐私」+「系统配置」
+        assert len(dialog.findChildren(QFrame, "section")) == 7
 
     def should_use_same_palette_for_buttons_and_status(self, qtbot, base_config):
         dialog = SettingsDialog(base_config)
@@ -401,6 +402,42 @@ def _wheel(widget, delta=-120):
                         Qt.NoScrollPhase, False)
     QApplication.sendEvent(widget, event)
     return event
+
+
+class TestSystemConfigSection:
+    """系统配置分区：非宠物参数（日志级别 / 分割阈值 / 保留天数 / 分档开关）。"""
+
+    def should_load_system_settings_into_controls(self, qtbot):
+        base = AppConfig.from_dict({"system": {"log_level": "warning",
+                                               "log_max_mb": 42,
+                                               "log_retention_days": 9,
+                                               "log_split_by_level": False}})
+        dialog = SettingsDialog(base)
+        qtbot.addWidget(dialog)
+
+        assert dialog._log_level.currentData() == "warning"
+        assert dialog._log_max_mb.value() == 42
+        assert dialog._log_retention.value() == 9
+        assert dialog._log_split.isChecked() is False
+
+    def should_collect_system_settings_without_losing_other_sections(self, qtbot,
+                                                                     base_config):
+        dialog = SettingsDialog(base_config)
+        qtbot.addWidget(dialog)
+        dialog._log_level.setCurrentIndex(dialog._log_level.findData("debug"))
+        dialog._log_max_mb.setValue(25)
+        dialog._log_retention.setValue(7)
+        dialog._log_split.setChecked(False)
+
+        cfg, error = dialog.collect()
+
+        assert error == ""
+        assert cfg.system.log_level == "debug"
+        assert cfg.system.log_max_mb == 25
+        assert cfg.system.log_retention_days == 7
+        assert cfg.system.log_split_by_level is False
+        assert cfg.ai.api_key == base_config.ai.api_key
+        assert cfg.pet.skin == base_config.pet.skin
 
 
 class TestReminderControlsClarity:

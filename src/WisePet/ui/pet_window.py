@@ -9,10 +9,11 @@ import logging
 from typing import Callable
 
 from PySide6.QtCore import QPropertyAnimation, QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from ..domain.config_model import AppConfig
+from ..domain.product import GrowthDecoration
 from .screen_bounds import ScreenBounds
 
 logger = logging.getLogger(__name__)
@@ -33,12 +34,14 @@ class PetWindow(QWidget):
 
     def __init__(self, controller, animator, config_provider: Callable[[], AppConfig],
                  screen_bounds: ScreenBounds, size: int = 128,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None,
+                 growth_provider: Callable[[], GrowthDecoration] | None = None):
         super().__init__(parent)
         self._controller = controller
         self._animator = animator
         self._config = config_provider
         self._screen = screen_bounds
+        self._growth_provider = growth_provider
         self._press_global = QPoint()
         self._last_global = QPoint()
         self._moved = False
@@ -79,9 +82,41 @@ class PetWindow(QWidget):
             painter.setCompositionMode(QPainter.CompositionMode_Source)
             painter.fillRect(self.rect(), Qt.transparent)
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            painter.drawPixmap(0, 0, self._animator.current_frame())
+            frame = self._animator.current_frame()
+            decoration = (self._growth_provider()
+                          if self._growth_provider is not None else None)
+            if decoration is None or not decoration.visible:
+                painter.drawPixmap(0, 0, frame)
+            else:
+                self._draw_with_growth(painter, frame, decoration)
         finally:
             painter.end()
+
+    def _draw_with_growth(self, painter: QPainter, frame, decoration) -> None:
+        """等级带来的可见差异：以脚线为锚整体缩放 + 头顶等级徽章。
+
+        不改素材文件（换素材要重跑导入管线，是当前已知瓶颈），只在绘制时叠加。
+        """
+        size = self.width()
+        painter.save()
+        painter.translate(size / 2, size)
+        painter.scale(decoration.scale, decoration.scale)
+        painter.drawPixmap(int(-size / 2), -size, frame)
+        painter.restore()
+        if not (decoration.ring or decoration.badge):
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        badge_rect = QRect(int(size * 0.30), 4, int(size * 0.40), 16)
+        painter.setPen(QPen(QColor(decoration.ring or "#E8A45C"), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(badge_rect, 8, 8)
+        if decoration.badge:
+            painter.setPen(QColor("#6B4F3A"))
+            font = painter.font()
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(badge_rect, Qt.AlignCenter, decoration.badge)
 
     def _on_frame(self, _pixmap) -> None:
         self.update()

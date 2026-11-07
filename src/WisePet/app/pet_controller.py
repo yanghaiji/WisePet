@@ -8,6 +8,8 @@ from typing import Callable
 
 from ..domain.actions import STATE_TO_ACTION, whole_cycle_duration_s
 from ..domain.config_model import AppConfig
+from ..domain.product import (CONTEXT_REST, CONTEXT_SLEEP, CONTEXT_STRETCH,
+                              BehaviorContext, context_hint)
 from ..domain.errors import IllegalTransitionError
 from ..domain.events import (
     REASON_ENERGY,
@@ -102,11 +104,13 @@ class PetController:
 
     def __init__(self, pet: Pet, bus, config_provider: Callable[[], AppConfig],
                  clock, rng: random.Random | None = None,
-                 bounds_provider: Callable[[], Bounds] | None = None):
+                 bounds_provider: Callable[[], Bounds] | None = None,
+                 context_provider: Callable[[], BehaviorContext | None] | None = None):
         self._pet = pet
         self._bus = bus
         self._config = config_provider
         self._clock = clock
+        self._context = context_provider or (lambda: None)
         self._rng = rng or random.Random()
         # 默认 bounds 足够大，由 ui 层注入真实工作区
         self._bounds_provider = bounds_provider or (lambda: (-10 ** 9, -10 ** 9, 10 ** 9, 10 ** 9))
@@ -275,6 +279,17 @@ class PetController:
             self._showcase_index += 1
             self._transition_to(showcase_state(self._showcase_index),
                                 autonomous=True)
+            return
+        # 因果驱动只作用于「非轮播」的那一次触发：轮播序号与覆盖度不受影响。
+        # 不调 self._rng，既有 StubRng 顺序断言在没注入 context 时行为完全一致。
+        hint = context_hint(self._context(), is_night)
+        if hint is CONTEXT_REST:
+            return                       # 专注 / 勿扰：原地安静，不位移不演示
+        if hint is CONTEXT_STRETCH:
+            self._transition_to(BehaviorState.STRETCHING, autonomous=True)
+            return
+        if hint is CONTEXT_SLEEP and is_night:
+            self._transition_to(BehaviorState.SLEEPING, autonomous=True)
             return
         if is_night and self._pet.vitals.energy < cfg.vitals.sad_threshold:
             self._transition_to(BehaviorState.SLEEPING, autonomous=True)

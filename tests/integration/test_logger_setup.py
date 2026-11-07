@@ -151,8 +151,9 @@ def should_keep_single_file_handler_when_setup_called_twice(clean_root, tmp_path
 
     second = setup_logging(tmp_path)
 
+    # 分级后是主日志档 + 错误档两个 RollingHandler，但重复调用不叠加
     rotating = [h for h in clean_root.handlers if isinstance(h, RotatingFileHandler)]
-    assert len(rotating) == 1
+    assert len(rotating) == 2
     assert second == tmp_path / LOG_DIR_NAME / LOG_FILE_NAME
 
 
