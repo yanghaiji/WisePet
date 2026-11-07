@@ -27,6 +27,12 @@ import sys
 import zipfile
 from pathlib import Path
 
+# CI 的 Windows runner 控制台默认 cp1252，中文日志直接 UnicodeEncodeError（真机 CI 踩过）：
+# 强制 stdout/stderr 走 UTF-8，个别字符兜底替换，绝不让日志炸掉打包流程
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parents[1]
 TMP = ROOT / "tmp" / "packaging"
 DIST = ROOT / "dist"

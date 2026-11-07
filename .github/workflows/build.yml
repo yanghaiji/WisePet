@@ -29,6 +29,8 @@ jobs:
         if: matrix.target == 'windows'
         run: choco install nsis -y --no-progress
       - name: 打包
+        env:
+          PYTHONIOENCODING: utf-8
         run: python tools/package.py --target ${{ matrix.target }}
       - name: 上传产物
         uses: actions/upload-artifact@v4
