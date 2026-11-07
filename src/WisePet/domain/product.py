@@ -112,11 +112,12 @@ def growth_decoration(level: int, enabled: bool = True) -> GrowthDecoration:
 
 @dataclass(frozen=True)
 class BehaviorContext:
-    """行为因果驱动的只读外部事实：时段 / 专注中 / 勿扰。"""
+    """行为因果驱动的只读外部事实：时段 / 专注中 / 勿扰 / 系统空闲秒数。"""
 
     hour: int = 12
     focusing: bool = False
     quiet: bool = False
+    idle_s: float = 0.0
 
 
 #: 上下文给出的动作建议；None 表示「照旧走轮播 + 概率」，不额外消耗随机数
@@ -136,6 +137,8 @@ def context_hint(ctx: BehaviorContext | None, is_night: bool) -> str | None:
         return CONTEXT_REST
     if is_night:
         return CONTEXT_SLEEP
+    if ctx.idle_s >= 600:
+        return CONTEXT_REST            # 人离开电脑超过 10 分钟，别自顾自乱窜
     if 6 <= ctx.hour <= 9:
         return CONTEXT_STRETCH
     return None

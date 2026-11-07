@@ -375,9 +375,11 @@ class SettingsDialog(QDialog):
                          self._water_interval, self._sedentary_interval,
                          self._quiet_daily, self._quiet_per_source,
                          self._memory_search_limit,
-                         self._log_max_mb, self._log_retention)
+                         self._log_max_mb, self._log_retention,
+                         self._trickle_every)
         for widget in value_widgets + (self._skin, self._weekly_weekday,
-                                       self._action_permission, self._log_level):
+                                       self._action_permission, self._log_level,
+                                       self._activity, self._overflow_mode):
             widget.wheel_target = self._scroll.viewport()
         for widget in value_widgets:
             # 上一轮把滚轮改成「只滚页面」、微调按钮又做成透明，用户以为没法输入。
@@ -561,11 +563,17 @@ class SettingsDialog(QDialog):
         self._skin = _NoWheelComboBox(box)
         for skin in self._skins:
             self._skin.addItem(SKIN_LABELS.get(skin, skin), skin)
+        self._activity = _NoWheelComboBox(box)
+        for label, value in (("安静一点", "quiet"), ("正常（推荐）", "normal"),
+                             ("活泼一点", "lively")):
+            self._activity.addItem(label, value)
+        self._activity.setToolTip("只影响多久自己出发一次，不改状态机与全部状态轮播")
         self._stick_to_floor = QCheckBox(
             "松手后自动落回屏幕底部（取消勾选可停在任意位置）", box)
         self._roam = QCheckBox(
             "自由漫游：可停留在桌面任意高度走动/睡觉，偶尔柔和地瞬移换地方", box)
         form.addRow("形象", self._skin)
+        form.addRow("活泼度", self._activity)
         form.addRow("走动速度", self._walk_speed)
         form.addRow("闲置间隔下限", self._idle_min)
         form.addRow("闲置间隔上限", self._idle_max)
@@ -665,6 +673,13 @@ class SettingsDialog(QDialog):
         form.addRow("每日上限", self._quiet_daily)
         form.addRow("单来源上限", self._quiet_per_source)
         form.addRow("免打扰", self._quiet_muted)
+        self._overflow_mode = _NoWheelComboBox(box)
+        self._overflow_mode.addItem("额度用完就安静（推荐）", "block")
+        self._overflow_mode.addItem("额度用完改降频（不整天静默）", "trickle")
+        self._trickle_every = _int_spin(2, 50, 5, " 次/条", box)
+        self._trickle_every.setToolTip("降频模式下，每被拦 N 次才放行 1 条")
+        form.addRow("超限策略", self._overflow_mode)
+        form.addRow("降频间隔", self._trickle_every)
         self._behavior_context = QCheckBox(
             "按当前时段 / 专注 / 勿扰决定动作（而不是纯随机轮播）", box)
         form.addRow("行为驱动", self._behavior_context)
@@ -733,6 +748,10 @@ class SettingsDialog(QDialog):
         self._stick_to_floor.setChecked(cfg.pet.stick_to_floor)
         self._roam.setChecked(getattr(cfg.pet, "roam", True))
         self._roam_jump_interval.setValue(int(getattr(cfg.pet, "roam_jump_interval_s", 30)))
+        activity_index = self._activity.findData(
+            getattr(cfg.pet, "activity", "normal"))
+        if activity_index >= 0:
+            self._activity.setCurrentIndex(activity_index)
         index = self._skin.findData(normalize_skin(cfg.pet.skin))
         if index >= 0:
             self._skin.setCurrentIndex(index)
@@ -776,6 +795,12 @@ class SettingsDialog(QDialog):
         self._quiet_per_source.setValue(
             int(quiet.per_source_limit) if quiet is not None else 4)
         self._quiet_muted.setChecked(quiet.muted if quiet is not None else False)
+        mode_index = self._overflow_mode.findData(
+            getattr(quiet, "overflow_mode", "block") if quiet is not None else "block")
+        if mode_index >= 0:
+            self._overflow_mode.setCurrentIndex(mode_index)
+        self._trickle_every.setValue(
+            int(getattr(quiet, "trickle_every", 5)) if quiet is not None else 5)
         behavior = getattr(cfg, "behavior", None)
         self._behavior_context.setChecked(
             behavior.context_driven if behavior is not None else True)
@@ -834,6 +859,7 @@ class SettingsDialog(QDialog):
         # 重建会把它们全部静默打回默认值（贴地开关也就永远关不掉）。
         pet = replace(self._base.pet,
                       skin=self._skin.currentData() or DEFAULT_SKIN,
+                      activity=self._activity.currentData() or "normal",
                       walk_speed_px_per_s=float(self._walk_speed.value()),
                       idle_min_s=float(self._idle_min.value()),
                       idle_max_s=float(self._idle_max.value()),
@@ -881,7 +907,9 @@ class SettingsDialog(QDialog):
                         enabled=self._quiet_enabled.isChecked(),
                         daily_limit=int(self._quiet_daily.value()),
                         per_source_limit=int(self._quiet_per_source.value()),
-                        muted=self._quiet_muted.isChecked())
+                        muted=self._quiet_muted.isChecked(),
+                        overflow_mode=self._overflow_mode.currentData() or "block",
+                        trickle_every=int(self._trickle_every.value()))
         behavior = replace(self._base.behavior,
                            context_driven=self._behavior_context.isChecked())
         memory = replace(self._base.memory,

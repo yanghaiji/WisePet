@@ -29,15 +29,40 @@ jobs:
       - name: 安装 NSIS（仅 Windows）
         if: matrix.target == 'windows'
         run: choco install nsis -y --no-progress
+      - name: 导入 macOS 签名证书（仅当用户配置了 secret）
+        # 未配置 MACOS_CERTIFICATE 时整步跳过，自动走「未签名 dmg」路径
+        if: matrix.target == 'macos' && secrets.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/wisepet-cert.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import /tmp/wisepet-cert.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
       - name: 打包
+        # 签名/公证凭据来自仓库 secrets；未配置时各项为空，脚本自动跳过对应步骤。
+        # WISEPET_NOTARIZE 必须是字面量 "1" 才触发公证，避免误提交空凭据。
         env:
           PYTHONIOENCODING: utf-8
+          WISEPET_CODESIGN_IDENTITY: ${{ secrets.WISEPET_CODESIGN_IDENTITY }}
+          WISEPET_NOTARIZE: ${{ secrets.WISEPET_NOTARIZE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: python tools/package.py --target ${{ matrix.target }}
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: WisePet-${{ matrix.target }}-${{ github.ref_name }}
-          path: dist/WisePet-*
+          # 只上传当次生成的包文件：旧的 dist/WisePet-* 会把历史解压目录
+          # 一并当成 artifact 上传，越积越大（真机「解压卡死」的成因之一）
+          path: |
+            dist/WisePet-*.zip
+            dist/WisePet-*-setup.exe
+            dist/WisePet-*.dmg
           if-no-files-found: error
 
   release:
@@ -59,7 +84,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/WisePet-*
+            dist/WisePet-*.zip
+            dist/WisePet-*-setup.exe
+            dist/WisePet-*.dmg
           draft: false
           prerelease: false
 

@@ -25,7 +25,8 @@ class PetMenu(QMenu):
                  on_scene: Callable[[str], None] | None = None,
                  on_toggle_mute: Callable[[], None] | None = None,
                  on_undo: Callable[[], None] | None = None,
-                 on_onboarding: Callable[[], None] | None = None):
+                 on_onboarding: Callable[[], None] | None = None,
+                 on_palette: Callable[[], None] | None = None):
         super().__init__(parent)
         self.setStyleSheet(
             "QMenu{background:#FFFDF7;border:1px solid #E2CFAF;border-radius:10px;"
@@ -44,6 +45,9 @@ class PetMenu(QMenu):
         self.act_stats = self.addAction("陪伴统计…")
         # 帧图按路径缓存在内存里，换素材后不重启看不到新图，所以留一个重载入口
         self.act_reload = self.addAction("重新加载素材")
+        self.act_palette = self.addAction("命令面板…（搜所有能力）")
+        self.status_action = self.addAction("")
+        self.status_action.setEnabled(False)     # 常驻状态说明，不可点
         self.addSeparator()
         # P1/P2：一键场景包 / 免打扰 / 撤销写盘 / 重看引导
         self.scenes_menu = self.addMenu("一键场景包")
@@ -83,7 +87,8 @@ class PetMenu(QMenu):
                                  (self.act_screenshot, on_screenshot),
                                  (self.act_mute, on_toggle_mute),
                                  (self.act_undo, on_undo),
-                                 (self.act_onboarding, on_onboarding)):
+                                 (self.act_onboarding, on_onboarding),
+                                 (self.act_palette, on_palette)):
             if callback is not None:
                 action.triggered.connect(callback)
             else:
@@ -102,3 +107,7 @@ class PetMenu(QMenu):
 
     def set_undo_enabled(self, enabled: bool) -> None:
         self.act_undo.setEnabled(enabled)
+
+    def set_companion_status(self, text: str) -> None:
+        """常驻显示「为什么安静/额度用完没」，不用等出问题才解释。"""
+        self.status_action.setText(text)

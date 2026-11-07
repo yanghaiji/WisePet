@@ -38,6 +38,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QCursor, QGuiApplication                    # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox               # noqa: E402
 
+from WisePet.app.action_audit import ActionAudit                       # noqa: E402
 from WisePet.app.action_protocol import (                               # noqa: E402
     ACTION_PROMPT_GUIDE,
     CreateFileAction,
@@ -57,6 +58,7 @@ from WisePet.app.action_protocol import (                               # noqa: 
 from WisePet.app.cheer_service import CheerService                      # noqa: E402
 from WisePet.app.chat_history import ChatHistory                        # noqa: E402
 from WisePet.app.chat_service import ChatService                       # noqa: E402
+from WisePet.app.data_steward import DataSteward                        # noqa: E402
 from WisePet.app.event_bus import EventBus                              # noqa: E402
 from WisePet.app.focus_service import FocusLog, FocusService           # noqa: E402
 from WisePet.app.growth_service import GrowthService                    # noqa: E402
@@ -67,6 +69,7 @@ from WisePet.app.news_service import NewsService                       # noqa: E
 from WisePet.app.one_shot_reminders import OneShotReminders             # noqa: E402
 from WisePet.app.pet_controller import PetController                   # noqa: E402
 from WisePet.app.reminder_service import ReminderService               # noqa: E402
+from WisePet.app.telemetry_service import TelemetryService             # noqa: E402
 from WisePet.app.tts_announcer import TtsAnnouncer                      # noqa: E402
 from WisePet.app.weekly_report import WeeklyReportService              # noqa: E402
 from WisePet.domain.chat_record import day_key                          # noqa: E402
@@ -105,16 +108,20 @@ from WisePet.infra.growth_store import GrowthStore                     # noqa: E
 from WisePet.infra.instance_guard import InstanceGuard                 # noqa: E402
 from WisePet.infra.logger_setup import reconfigure_logging, setup_logging  # noqa: E402
 from WisePet.infra.news_feed import fetch_headlines                    # noqa: E402
+from WisePet.infra.platform_idle import idle_seconds                    # noqa: E402
 from WisePet.infra.platform_util import set_notification_app_id         # noqa: E402
 from WisePet.infra.reminder_store import ReminderStore                 # noqa: E402
 from WisePet.infra.tts import create_synthesizer                       # noqa: E402
 from WisePet.infra.weekly_store import WeeklyStore                     # noqa: E402
 from WisePet.infra.openai_client import OpenAICompatClient             # noqa: E402
 from WisePet.infra.ppt_builder import build_ppt                        # noqa: E402
-from WisePet.infra.product_store import MemoryStore, QuietStore         # noqa: E402
+from WisePet.infra.product_store import (                              # noqa: E402
+    ActionAuditStore, MemoryStore, QuietStore)
+from WisePet.infra.telemetry_store import TelemetryStore               # noqa: E402
 from WisePet.infra.pet_state_repo import PetStateRepository            # noqa: E402
 from WisePet.infra.system_clock import SystemClock                     # noqa: E402
 from WisePet.ui.action_confirm import ActionConfirmDialog               # noqa: E402
+from WisePet.ui.command_palette import CommandPalette                   # noqa: E402
 from WisePet.ui.ai_worker import AiWorker                              # noqa: E402
 from WisePet.ui.onboarding_dialog import OnboardingDialog               # noqa: E402
 from WisePet.ui.chat_input import ChatInput                             # noqa: E402
@@ -142,6 +149,27 @@ MOTION_INTERVAL_MS = 50
 PET_ID = "mochi"
 #: 宠物窗口边长与动画画布一致，便于把位置/锚点换算统一交给工作区 bounds
 PET_SIZE = CANVAS_SIZE
+
+#: 命令面板注册表（id, 标题, 说明）：把散落在右键菜单 / 设置分区 / 托盘里的
+#: 能力收成一处可搜索入口，避免菜单继续膨胀。id 同时用作本地埋点事件名。
+COMMANDS: tuple[tuple[str, str, str], ...] = (
+    ("chat", "跟我聊天", "打开输入条"),
+    ("history", "历史对话", "按天回看并继续聊"),
+    ("search", "搜聊天记录", "跨日全文检索"),
+    ("reminder", "排个提醒", "1 分钟后提醒喝水"),
+    ("focus", "番茄钟", "开始一轮专注"),
+    ("scene_healthy", "恢复热闹", "健康作息：重新打开推送"),
+    ("scene_deep", "安静一会儿", "深度工作：少打扰"),
+    ("why_quiet", "为什么没弹窗", "当前场景 / 额度 / 免打扰"),
+    ("export", "导出聊天记录", "写到本机 Markdown"),
+    ("usage", "本机数据占用", "记录数与磁盘大小"),
+    ("metrics", "陪伴指标", "激活 / 留存 / 打扰护栏"),
+    ("clear_metrics", "清空本地埋点", "一键清除本机指标"),
+    ("memory", "我记得你什么", "本地长期记忆时间线"),
+    ("audit", "最近执行的操作", "写盘 / 工具历史"),
+    ("settings", "打开设置", "系统配置等分区"),
+    ("stats", "陪伴统计", "天数 / 消息数 / 等级"),
+)
 #: 启动问候兜底语（未连模型或生成失败时；{name} 填宠物名）
 STARTUP_GREETING_FALLBACK = "{name}来召唤你啦，让我们开启美好的一天吧！"
 #: 开机问候的 AI 等待上限（秒）：远小于聊天 timeout_s，超时即回落兜底语，不拖慢开机问候
@@ -185,6 +213,13 @@ class PetApplication:
                                          lambda: self._config)
         self._memory = LongTermMemory(MemoryStore(self._data_dir),
                                       lambda: self._config.memory.enabled)
+        # P0：本地埋点（只记事件名与按天计数，绝不上传）+ 崩溃本地留痕
+        self._telemetry = TelemetryService(TelemetryStore(self._data_dir), self._clock)
+        self._telemetry.install_crash_hook()
+        self._audit = ActionAudit(ActionAuditStore(self._data_dir))
+        self._data_steward = DataSteward(self._chat_log_repo, self._data_dir,
+                                         telemetry=self._telemetry)
+        self._active_scene = "自定义"
         self._last_action_receipt: dict | None = None
 
         self._reminder_kind: str | None = None
@@ -276,12 +311,15 @@ class PetApplication:
                              on_scene=self._apply_scene,
                              on_toggle_mute=self._toggle_mute,
                              on_undo=self._undo_last_action,
-                             on_onboarding=self._show_onboarding)
+                             on_onboarding=self._show_onboarding,
+                             on_palette=self._show_palette)
         self._stats_dialog = StatsDialog(self._screen)
         self._onboarding_dialog = OnboardingDialog()
         self._onboarding_dialog.try_chat.connect(self._show_chat_input)
         self._onboarding_dialog.try_reminder.connect(self._demo_reminder)
         self._onboarding_dialog.completed.connect(self._mark_onboarding_done)
+        self._command_palette = CommandPalette(list(COMMANDS))
+        self._command_palette.executed.connect(self._run_command)
         # 无边框 Tool 窗隐藏后没有可右键之处，托盘是唯一还能点的入口（FR v1.11 C21）
         self._tray = PetTrayIcon(self._menu, self._animator.current_frame(),
                                  on_activate=self.toggle_visible, parent=self._app)
@@ -295,6 +333,7 @@ class PetApplication:
         self._worker = AiWorker(self._chat, parent=self._app)
         self._menu.set_muted(self._config.quiet.muted)
         self._menu.set_undo_enabled(self._last_action_receipt is not None)
+        self._refresh_companion_status()
         self._memory.hydrate(getattr(self._local, "_engine", None))
 
         self._tick_timer = None          # start() 后才挂，测试可只构建不启动
@@ -311,7 +350,8 @@ class PetApplication:
         return BehaviorContext(
             hour=time.localtime(self._clock.now()).tm_hour,
             focusing=bool(getattr(self._focus, "running", False)),
-            quiet=self._config.quiet.muted or self._quiet_deferral() > 0)
+            quiet=self._config.quiet.muted or self._quiet_deferral() > 0,
+            idle_s=float(idle_seconds() or 0.0))
 
     def _growth_decoration(self):
         """等级 → 可见外观；关掉成长体系时不叠加任何装饰。"""
@@ -334,6 +374,8 @@ class PetApplication:
         if updated is self._config:
             return
         self.apply_config(updated)
+        self._active_scene = scene_label(scene_id)
+        self._refresh_companion_status()
         # 场景包会一次改掉多个开关，只说「换好了」用户根本不知道弹窗为什么消失。
         quiet = updated.quiet
         notice = (f"已切到「{scene_label(scene_id)}」："
@@ -369,6 +411,81 @@ class PetApplication:
         self._one_shot.schedule(RemindAction(text="喝口水，顺便伸个懒腰吧",
                                              delay_min=1.0))
         self._controller.speak("好，1 分钟后我来叫你～", source="system")
+
+    # ---------- P0/P1/P2：命令面板 · 陪伴状态 · 本地数据管家 ----------
+
+    def _report(self, text: str) -> None:
+        """命令结果用自绘气泡反馈；不经过打扰预算，保证用户主动发起必达。"""
+        self._controller.start_speaking()
+        self._bubble.show_text(
+            text, source="system", title="WisePet",
+            anchor=self._window.bubble_anchor(),
+            on_close=self._controller.on_action_finished)
+        self._sync_window()
+
+    def _companion_status_text(self) -> str:
+        cfg = self._config
+        used = self._quiet_budget.usage()
+        return (f"当前：{self._active_scene} ｜ "
+                f"新闻{'开' if cfg.news.enabled else '关'} "
+                f"鼓励{'开' if cfg.cheer.enabled else '关'} "
+                f"周报{'开' if cfg.weekly.enabled else '关'} ｜ "
+                f"今日推送 {used['total']}/{cfg.quiet.daily_limit} ｜ "
+                f"免打扰{'开' if cfg.quiet.muted else '关'}")
+
+    def _refresh_companion_status(self) -> None:
+        self._menu.set_companion_status(self._companion_status_text())
+
+    def _show_palette(self) -> None:
+        self._command_palette.show_centered()
+
+    def _run_command(self, command_id: str) -> None:
+        self._telemetry.track(f"cmd:{command_id}")
+        if command_id == "chat":
+            self._show_chat_input()
+        elif command_id == "history":
+            self._show_history()
+        elif command_id == "search":
+            self._show_history()
+            self._chat_window.search_input.setFocus()
+        elif command_id == "reminder":
+            self._demo_reminder()
+        elif command_id == "focus":
+            self._start_focus(self._config.focus.default_min)
+        elif command_id in ("scene_healthy", "scene_deep"):
+            self._apply_scene("healthy" if command_id == "scene_healthy" else "deep_work")
+        elif command_id == "why_quiet":
+            self._report(self._companion_status_text())
+        elif command_id == "export":
+            target = self._data_dir / "chat-export.md"
+            count = self._data_steward.export_all(target)
+            self._report(f"已导出 {count} 条聊天记录到 {target}")
+        elif command_id == "usage":
+            self._report(f"本机数据：{self._data_steward.usage()}")
+        elif command_id == "metrics":
+            metrics = self._telemetry.metrics()
+            self._report(f"首次对话 {'达成' if metrics['ttfv_chat'] else '未达成'} ｜ "
+                         f"活跃 {metrics['active_days']} 天 ｜ "
+                         f"提醒关闭率 {metrics['reminder_dismiss_rate']} ｜ "
+                         f"崩溃 {metrics['crash_count']} 次 ｜ "
+                         f"事件 {metrics['events_total']} 条")
+        elif command_id == "clear_metrics":
+            self._telemetry.clear()
+            self._report("本地埋点已清空（聊天记录与其它数据未动）。")
+        elif command_id == "memory":
+            timeline = self._memory.timeline()
+            self._report("我记得：" + "；".join(
+                f"{item['day']} {item['key']}={item['value']}" for item in timeline)
+                if timeline else "还没记下什么；聊天时告诉我名字或近况就行。")
+        elif command_id == "audit":
+            recent = self._audit.recent()
+            self._report("最近操作：" + "；".join(
+                f"{e['kind']}→{e['target']}（{e['result']}）" for e in recent)
+                if recent else "还没有执行过写盘操作。")
+        elif command_id == "settings":
+            self.open_settings()
+        elif command_id == "stats":
+            self._show_stats()
 
     # ---------- 生命周期 ----------
 
@@ -408,6 +525,8 @@ class PetApplication:
         self._motion_timer.timeout.connect(self.tick_motion)
         logger.info("pet started (assets dir=%s)", self._assets_dir)
         self._log_chat_brain(when="boot")
+        self._telemetry.once("first_seen")
+        self._telemetry.track("app_start")
         self._greet_on_start()   # 每次打开宠物：后台来一句昂扬问候，不拖冷启动
         if self._onboarding_enabled and not self._onboarding_done():
             # 延后到出场动画之后，别和开机问候/特效抢这一秒
@@ -671,6 +790,7 @@ class PetApplication:
 
     def _handle_quick_reminder(self, text: str, action: RemindAction) -> None:
         """本地快速通道：立即排期 + 双向落聊天记录 + 气泡确认。"""
+        self._telemetry.once("first_reminder_done")
         self._one_shot.schedule(action)
         confirm = f"好，{describe_action(action)}，到点我叫你"
         ts = time.time()
@@ -814,6 +934,9 @@ class PetApplication:
                     on_close=self._controller.on_action_finished)
                 self._sync_window()
             return
+        self._refresh_companion_status()
+        if event.source == "reminder":
+            self._telemetry.track("reminder_shown")
         with_ack = event.source == "reminder"
         if not with_ack:
             self._controller.start_speaking()
@@ -846,6 +969,7 @@ class PetApplication:
     def _on_chunk(self, event: ChatReplyChunkEvent) -> None:
         if event.done:
             self._streaming = False
+            self._telemetry.once("first_chat_done")
             action = parse_action(event.reply)
             if action is not None:
                 self._handle_action(action)   # 模型返回的是操作指令，不当文本展示
@@ -879,6 +1003,7 @@ class PetApplication:
             return
         permission = permission_required(action, self._config.actions.write_permission)
         if permission == PERMISSION_DENY:
+            self._audit.record(type(action).__name__, action.path, "denied")
             self._bubble.end_stream("这个操作被设置挡下了（写盘权限：一律拒绝）",
                                     anchor=anchor,
                                     on_close=self._controller.on_action_finished)
@@ -891,6 +1016,7 @@ class PetApplication:
             self._sync_window()
             approved, remembered = self._confirm_action(action)
             if not approved:
+                self._audit.record(type(action).__name__, action.path, "cancelled")
                 self._controller.speak("好的，先不动文件。", source="system")
                 return
             if remembered and self._config.actions.remember_allowed:
@@ -905,9 +1031,11 @@ class PetApplication:
                      else build_ppt(action.path, action.title,
                                     [dict(slide) for slide in action.slides]))
         except OSError as exc:
+            self._audit.record(type(action).__name__, action.path, "failed")
             logger.warning("action write failed: %s", exc)
             self._controller.speak(f"呜，没写成（{exc}）", source="system")
             return
+        self._audit.record(type(action).__name__, str(saved), "ok")
         self._last_action_receipt = receipt
         self._menu.set_undo_enabled(True)
         self._controller.speak(f"搞定啦，文件在这里：{saved}（右键可撤销）",
@@ -1113,6 +1241,7 @@ class PetApplication:
         return polished or None
 
     def _ack_reminder(self) -> None:
+        self._telemetry.track("reminder_dismissed")
         if self._reminder_kind is not None:
             self._reminder.notify_ack(self._reminder_kind)
             self._reminder_kind = None
@@ -1160,6 +1289,7 @@ class PetApplication:
         self._sync_model_combo()
         self._menu.set_muted(config.quiet.muted)
         self._menu.set_undo_enabled(self._last_action_receipt is not None)
+        self._refresh_companion_status()
         self._memory.hydrate(getattr(self._local, "_engine", None))
         # 系统配置（日志级别 / 分割阈值 / 保留天数 / 分档）保存后热重建，不用重启
         if config.system != previous_system:

@@ -30,6 +30,7 @@ class LongTermMemory:
         self._store = store
         self._enabled = enabled_provider
         self._facts: dict[str, str] = self._store.load()
+        self._history: list[dict] = self._store.load_history()
 
     def learn_from(self, text: str) -> bool:
         """从一句用户输入里抽取事实；有新增才落盘，返回是否变化。"""
@@ -55,7 +56,12 @@ class LongTermMemory:
         if not changed:
             return False
         self._facts.update(changed)
-        self._store.save(self._facts)
+        from ..domain.chat_record import day_key
+        day = day_key()
+        self._history.extend({"day": day, "key": key, "value": value}
+                             for key, value in changed.items())
+        self._history = self._history[-50:]
+        self._store.save(self._facts, self._history)
         logger.info("long-term memory updated: %s", sorted(changed))
         return True
 
@@ -91,6 +97,11 @@ class LongTermMemory:
     def values(self) -> dict[str, str]:
         return dict(self._facts)
 
+    def timeline(self) -> list[dict]:
+        """跨会话事实时间线：什么时候记下了什么，供「我记得你什么」回看。"""
+        return list(self._history) if self._enabled() else []
+
     def clear(self) -> None:
         self._facts = {"user_name": "", "activity": "", "project": ""}
-        self._store.save(self._facts)
+        self._history = []
+        self._store.save(self._facts, self._history)

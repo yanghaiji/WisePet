@@ -646,7 +646,10 @@ class PetController:
         cfg = cfg or self._config()
         lo = min(cfg.pet.idle_min_s, cfg.pet.idle_max_s)
         hi = max(cfg.pet.idle_min_s, cfg.pet.idle_max_s)
-        return self._rng.uniform(lo, hi)
+        # 活泼度只缩放「多久出发一次」，不改状态机与轮播覆盖；normal 保持原语义
+        factor = {"quiet": 1.8, "lively": 0.6}.get(
+            getattr(cfg.pet, "activity", "normal"), 1.0)
+        return self._rng.uniform(lo, hi) * factor
 
     def _reschedule_idle(self, now: float, cfg: AppConfig | None = None) -> None:
         """收场后重新排空闲间隔。

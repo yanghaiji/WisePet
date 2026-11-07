@@ -25,12 +25,14 @@ class QuietBudget:
         self._data = self._store.load()
         self._exhausted = False
         self._notified_day: str | None = None
+        self._blocked_today = 0
 
     def _roll_day(self) -> dict:
         day = time.strftime("%Y-%m-%d", time.localtime(self._clock.now()))
         if self._data.get("day") != day:
             self._data = {"day": day, "total": 0, "by_source": {}}
             self._exhausted = False
+            self._blocked_today = 0
             self._store.save(self._data)
         by_source = self._data.get("by_source")
         if not isinstance(by_source, dict):
@@ -55,6 +57,15 @@ class QuietBudget:
         source_used = int(by_source.get(source) or 0)
         if used >= cfg.daily_limit or source_used >= cfg.per_source_limit:
             self._exhausted = True
+            self._blocked_today += 1
+            # 降频模式：额度满了不是整天静默，而是每 N 次放一条过去。
+            # 放行的这条不再计入额度（额度已满），也不会造成刷屏。
+            every = max(2, int(getattr(cfg, "trickle_every", 5)))
+            if (getattr(cfg, "overflow_mode", "block") == "trickle"
+                    and self._blocked_today % every == 0):
+                logger.info("quiet budget trickle: source=%s blocked=%d every=%d",
+                            source, self._blocked_today, every)
+                return True
             logger.info("quiet budget blocked push: source=%s day=%s total=%d/%d source=%d/%d",
                         source, data.get("day"), used, cfg.daily_limit,
                         source_used, cfg.per_source_limit)
@@ -89,4 +100,5 @@ class QuietBudget:
         if self._data.get("day") != day:
             return {"day": day, "total": 0, "by_source": {}}
         return {"day": day, "total": int(self._data.get("total") or 0),
-                "by_source": dict(self._data.get("by_source") or {})}
+                "by_source": dict(self._data.get("by_source") or {}),
+                "blocked": self._blocked_today}

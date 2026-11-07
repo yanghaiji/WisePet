@@ -131,6 +131,13 @@ class SqliteChatRepository:
         with closing(self._connect()) as conn:
             return int(conn.execute("SELECT count(*) FROM chat_turns").fetchone()[0])
 
+    def delete_day(self, day: str) -> int:
+        """本地数据管家：按天彻底删除（对应旧「删某天 JSON 文件」的语义）。"""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute("DELETE FROM chat_turns WHERE day = ?", (day,))
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
     # ---------- 建表与损坏自愈 ----------
 
     def _ensure_schema(self) -> None:

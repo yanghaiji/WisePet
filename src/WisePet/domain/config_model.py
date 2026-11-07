@@ -60,6 +60,7 @@ class PetParams:
     roam_jump_interval_s: float = 30.0  # 柔和瞬移换地方的间隔秒（0 = 不瞬移）
     max_turns: int = 20                 # 会话保留轮数（PRD US-3）
     click_move_threshold_px: int = 5    # 区分点击与拖拽的位移阈值
+    activity: str = "normal"            # 活泼度：quiet / normal / lively，缩放自主行为间隔
 
 
 @dataclass
@@ -154,6 +155,8 @@ class QuietBudgetSettings:
     daily_limit: int = 12
     per_source_limit: int = 4
     muted: bool = False
+    overflow_mode: str = "block"   # block 全停 / trickle 降频（不再是整天静默）
+    trickle_every: int = 5         # trickle 模式每 N 次拦截放行 1 次
 
 
 @dataclass
@@ -262,6 +265,8 @@ class AppConfig:
         pet_d = data.get("pet") or {}
         pet = PetParams(
             skin=normalize_skin(pet_d.get("skin")),
+            activity=_choice(pet_d.get("activity"), defaults.pet.activity,
+                             ("quiet", "normal", "lively")),
             walk_speed_px_per_s=_num(pet_d.get("walk_speed_px_per_s"), defaults.pet.walk_speed_px_per_s),
             run_speed_px_per_s=_num(pet_d.get("run_speed_px_per_s"), defaults.pet.run_speed_px_per_s),
             idle_min_s=_num(pet_d.get("idle_min_s"), defaults.pet.idle_min_s),
@@ -373,6 +378,11 @@ class AppConfig:
             per_source_limit=_int_clamp(q_d.get("per_source_limit"),
                                         defaults.quiet.per_source_limit, 1, 100),
             muted=_bool(q_d.get("muted"), defaults.quiet.muted),
+            overflow_mode=_choice(q_d.get("overflow_mode"),
+                                  defaults.quiet.overflow_mode,
+                                  ("block", "trickle")),
+            trickle_every=_int_clamp(q_d.get("trickle_every"),
+                                     defaults.quiet.trickle_every, 2, 50),
         )
         b_d = data.get("behavior") or {}
         behavior = BehaviorSettings(
