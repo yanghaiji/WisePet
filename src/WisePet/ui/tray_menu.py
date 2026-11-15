@@ -26,7 +26,8 @@ class PetMenu(QMenu):
                  on_toggle_mute: Callable[[], None] | None = None,
                  on_undo: Callable[[], None] | None = None,
                  on_onboarding: Callable[[], None] | None = None,
-                 on_palette: Callable[[], None] | None = None):
+                 on_palette: Callable[[], None] | None = None,
+                 on_profile: Callable[[], None] | None = None):
         super().__init__(parent)
         self.setStyleSheet(
             "QMenu{background:#FFFDF7;border:1px solid #E2CFAF;border-radius:10px;"
@@ -65,6 +66,7 @@ class PetMenu(QMenu):
         self.act_undo = self.addAction("撤销上一次写文件")
         self.act_undo.setEnabled(False)
         self.act_onboarding = self.addAction("再看一次新手引导")
+        self.act_profile = self.addAction("切换身份…（家人各养各的宠物）")
         self.addSeparator()
         self.act_toggle = self.addAction("隐藏宠物")
         self.act_quit = self.addAction("退出")
@@ -88,7 +90,8 @@ class PetMenu(QMenu):
                                  (self.act_mute, on_toggle_mute),
                                  (self.act_undo, on_undo),
                                  (self.act_onboarding, on_onboarding),
-                                 (self.act_palette, on_palette)):
+                                 (self.act_palette, on_palette),
+                                 (self.act_profile, on_profile)):
             if callback is not None:
                 action.triggered.connect(callback)
             else:

@@ -112,22 +112,29 @@ def growth_decoration(level: int, enabled: bool = True) -> GrowthDecoration:
 
 @dataclass(frozen=True)
 class BehaviorContext:
-    """行为因果驱动的只读外部事实：时段 / 专注中 / 勿扰 / 系统空闲秒数。"""
+    """行为因果驱动的只读外部事实：时段 / 星期 / 专注 / 勿扰 / 系统空闲秒数。
+
+    weekday 默认 -1 表示「未知」（旧调用不传星期时行为与以前完全一致）；
+    just_finished_focus 只在专注刚结束的一小段窗口内为真。
+    """
 
     hour: int = 12
     focusing: bool = False
     quiet: bool = False
     idle_s: float = 0.0
+    weekday: int = -1                 # 0=周一 … 6=周日（Python time.localtime 口径）
+    just_finished_focus: bool = False
 
 
 #: 上下文给出的动作建议；None 表示「照旧走轮播 + 概率」，不额外消耗随机数
 CONTEXT_REST = "rest"
 CONTEXT_STRETCH = "stretch"
 CONTEXT_SLEEP = "sleep"
+CONTEXT_ENERGIZE = "energize"         # 周一早晨：精神一点，小跑
 
 
 def context_hint(ctx: BehaviorContext | None, is_night: bool) -> str | None:
-    """把生活情境翻译成动作倾向：专注/勿扰要安静，清晨伸懒腰，深夜去睡。
+    """把生活情境翻译成动作倾向：专注/勿扰要安静，刚结束专注伸懒腰，深夜去睡。
 
     优先级按「用户当下处境」排：专注和勿扰比时段更重要，避免写作业时乱窜。
     """
@@ -135,10 +142,14 @@ def context_hint(ctx: BehaviorContext | None, is_night: bool) -> str | None:
         return None
     if ctx.focusing or ctx.quiet:
         return CONTEXT_REST
-    if is_night:
+    if ctx.just_finished_focus:
+        return CONTEXT_STRETCH         # 刚打完一场硬仗，先舒展一下
+    if is_night or ctx.hour >= 23 or ctx.hour < 6:
         return CONTEXT_SLEEP
     if ctx.idle_s >= 600:
         return CONTEXT_REST            # 人离开电脑超过 10 分钟，别自顾自乱窜
+    if ctx.weekday == 0 and 6 <= ctx.hour <= 9:
+        return CONTEXT_ENERGIZE        # 周一早晨，比平日清晨更有劲
     if 6 <= ctx.hour <= 9:
         return CONTEXT_STRETCH
     return None
@@ -152,6 +163,10 @@ PUSH_SOURCES: frozenset[str] = frozenset({
 #: 少数服务用 source="system" 但确实是程序主动推送，靠标题兜住
 PUSH_TITLES: frozenset[str] = frozenset({
     "本周回忆录", "成长", "开启新的一天", "定时提醒", "加油打气", "喝水提醒", "久坐提醒",
+    "我还记得", "好久不见", "我在呢",
+    # 轴②：托付任务与事件驱动主动（source 也已在 PUSH_SOURCES，标题显式列出便于审计）
+    "接下托付", "托付太多", "我盯着的事有动静了", "还惦记着呢",
+    "托付收尾", "托付停下了", "你回来啦", "夜深了", "今天很拼",
 })
 
 

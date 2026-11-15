@@ -10,7 +10,7 @@ import logging
 from datetime import datetime
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -22,7 +22,14 @@ from ..domain.chat_record import day_key
 from ..domain.events import (
     PHASE_DONE, PHASE_ERROR, PHASE_IDLE, PHASE_REPLYING, PHASE_THINKING,
 )
-from .chat_text_edit import ChatTextEdit, attachment_from_clipboard_image
+from .chat_text_edit import (
+    ChatTextEdit,
+    attachments_from_paths,
+    attachment_from_clipboard_image,
+    local_file_paths,
+)
+from .markdown_render import render_markdown
+from .resize_grip import ResizeGrip
 from .screen_bounds import ScreenBounds, fit_beside_width
 
 logger = logging.getLogger(__name__)
@@ -90,6 +97,13 @@ QPushButton#close {
     font-size: 18px; border-radius: 10px; min-width: 26px; min-height: 26px;
 }
 QPushButton#close:hover { background: #F3E1C6; color: #6B4F3A; }
+QPushButton#winbtn {
+    background: transparent; border: none; color: #B09A7C;
+    font-size: 13px; border-radius: 8px; min-width: 22px; min-height: 22px;
+    padding: 0;
+}
+QPushButton#winbtn:hover { background: #F7EEDC; color: #7A5C3D; }
+QPushButton#winbtn:pressed { background: #EFE0C6; color: #5A3E28; }
 QTextBrowser {
     background: #FFFBF2; border: 1px solid #EFE0C6; border-radius: 12px;
     padding: 10px; color: #3A2B21;
@@ -125,7 +139,11 @@ def _clock_of(ts: float) -> str:
 
 
 def _bubble_html(record) -> str:
-    """一条消息 = 一行小字元信息 + 一个带底色的气泡（Qt 富文本兼容写法）。"""
+    """一条消息 = 一行小字元信息 + 一个带底色的气泡（Qt 富文本兼容写法）。
+
+    助手消息完整渲染 markdown（标题/代码块/表格等，mistune 转义防注入）；
+    用户消息保持纯文本原样（自己敲的字不做二次解释）。
+    """
     mine = record.role == "user"
     bg = _BUBBLE_BG.get("fallback" if record.source == "fallback" else record.role,
                         _BUBBLE_BG["assistant"])
@@ -133,7 +151,10 @@ def _bubble_html(record) -> str:
     role = _ROLE_TEXT.get(record.role, record.role)
     source = _SOURCE_TEXT.get(record.source, "")
     meta = f"{_clock_of(record.ts)} · {role}" + (f" · {source}" if source else "")
-    content = html.escape(record.content).replace("\n", "<br>")
+    if mine:
+        content = html.escape(record.content).replace("\n", "<br>")
+    else:
+        content = render_markdown(record.content)
     return (
         '<table width="100%" cellpadding="0" cellspacing="0" '
         'style="margin:5px 0 12px 0;">'
@@ -178,15 +199,23 @@ class ChatWindow(QWidget):
         self._drag_global: QPoint | None = None
         self._drag_window_pos: QPoint | None = None
         self._pinned = False               # 用户手动拖过之后不再被宠物位置拽回
+        self._user_resized = False         # 用户拖过右下手柄后，自动改宽不再覆盖
+        self._maximized = False            # ▢ 最大化状态（铺满工作区）
+        self._restore_geo: QRect | None = None
         self._attachments: list[Attachment] = []
 
         self.setWindowTitle("WisePet 历史对话")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAcceptDrops(True)      # 文件可直接拖进窗口任意位置当附件
         # 不固定宽度：宠物在窄工作区中间时要能缩到「较宽那侧」放得下
         self.setMinimumWidth(_WINDOW_MIN_WIDTH)
         self.resize(_WINDOW_WIDTH, _WINDOW_HEIGHT)
         self.setStyleSheet(_STYLE + _SEARCH_STYLE)
+        # 右下角尺寸手柄：无边框窗口没有系统边框，拖它调整大小
+        self._grip = ResizeGrip(self)
+        self._grip.min_size = QSize(_WINDOW_MIN_WIDTH, 320)
+        self._grip.user_resized.connect(lambda: setattr(self, "_user_resized", True))
 
         card = QFrame(self)
         card.setObjectName("historyCard")
@@ -209,10 +238,18 @@ class ChatWindow(QWidget):
         model_label.setObjectName("hint")
         self._model_combo.currentTextChanged.connect(
             lambda name: self.model_selected.emit(name))
+        self._min_btn = QPushButton("—", card)
+        self._min_btn.setObjectName("winbtn")
+        self._min_btn.setToolTip("收起窗口")
+        self._max_btn = QPushButton("▢", card)
+        self._max_btn.setObjectName("winbtn")
+        self._max_btn.setToolTip("最大化 / 还原（铺满工作区）")
         self._close_btn = QPushButton("×", card)
         self._close_btn.setObjectName("close")
         self._close_btn.setToolTip("关闭")
         self._close_btn.clicked.connect(self.hide)
+        self._min_btn.clicked.connect(self.hide)
+        self._max_btn.clicked.connect(self._toggle_maximize)
 
         head = QHBoxLayout()
         head.setContentsMargins(16, 14, 12, 6)
@@ -223,6 +260,8 @@ class ChatWindow(QWidget):
         head.addWidget(self._day_combo)
         head.addWidget(model_label)
         head.addWidget(self._model_combo)
+        head.addWidget(self._min_btn)
+        head.addWidget(self._max_btn)
         head.addWidget(self._close_btn)
         # 无边框窗口没有系统标题栏，标题区（含 dot/标题/card 空白处）负责拖动
         for widget in (card, dot, title):
@@ -254,10 +293,11 @@ class ChatWindow(QWidget):
         self._history.setOpenExternalLinks(False)
         self._edit = ChatTextEdit(card)
         self._edit.setObjectName("chatEdit")
-        self._edit.setPlaceholderText("接着聊点什么…（回车发送，Shift+回车换行，Esc 关闭）")
+        self._edit.setPlaceholderText("接着聊点什么…（回车发送，Shift+回车换行，可拖入文件）")
         self._edit.send_requested.connect(self._submit)
         self._edit.dismissed.connect(self.hide)
         self._edit.image_pasted.connect(self._add_clipboard_image)
+        self._edit.files_dropped.connect(self._add_dropped_files)
         self._attach_btn = QPushButton("📎", card)
         self._attach_btn.setObjectName("attach")
         self._attach_btn.setToolTip("附加图片或文本文件（图片需视觉模型）")
@@ -358,6 +398,33 @@ class ChatWindow(QWidget):
             self._attachments.append(att)
             self._sync_files_label()
 
+    def _add_dropped_files(self, paths: list[str]) -> None:
+        """拖进来的文件 → 附件（超限/类型错误时提示，已合法的照常收下）。"""
+        attachments, error = attachments_from_paths(paths)
+        if attachments:
+            self._attachments.extend(attachments)
+        self._sync_files_label()
+        if error:                          # 先显示已收下的，再补错误说明
+            # 不能用 isVisible() 判断：窗口隐藏时子控件恒 False，会丢掉已收下附件的提示
+            base = self._files.text()
+            self._files.setText(f"{base} ｜ {error}".strip(" ｜"))
+            self._files.show()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        """窗口任意位置（含空白处）都接受文件拖入；输入框由子控件自行处理。"""
+        if local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        paths = local_file_paths(event.mimeData())
+        if paths:
+            self._add_dropped_files(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
     def _pick_files(self) -> None:
         paths, _filter = QFileDialog.getOpenFileNames(
             self, "附加文件（可多选）", "",
@@ -384,8 +451,20 @@ class ChatWindow(QWidget):
         self._files.setText("📎 " + " + ".join(att.name for att in self._attachments))
         self._files.show()
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        """尺寸手柄贴右下角并置顶（卡片是不透明子控件，不置顶会盖住手柄）。"""
+        self._grip.move(self.width() - 16, self.height() - 16)
+        self._grip.raise_()
+        super().resizeEvent(event)
+
     def _place(self, pet_rect) -> None:
-        if self._screen is not None:
+        if self._user_resized:
+            # 用户拖过手柄：只重新贴位，不改宽高
+            if self._screen is not None:
+                x, y = self._screen.place_beside(pet_rect, self.width(), self.height())
+            else:
+                x, y = pet_rect.left() - self.width() - 12, pet_rect.center().y()
+        elif self._screen is not None:
             width = fit_beside_width(self._screen.geometry(), pet_rect, self.width(),
                                      _WINDOW_MIN_WIDTH)
             self.resize(width, self.height())
@@ -393,6 +472,26 @@ class ChatWindow(QWidget):
         else:
             x, y = pet_rect.left() - self.width() - 12, pet_rect.center().y()
         self.move(x, y)
+
+    def _toggle_maximize(self) -> None:
+        """▢ 最大化：铺满工作区（留 8px 边距）；再点还原到之前的几何。"""
+        if self._maximized:
+            self._maximized = False
+            if self._restore_geo is not None:
+                self.setGeometry(self._restore_geo)
+            self._max_btn.setText("▢")
+            self._max_btn.setToolTip("最大化 / 还原（铺满工作区）")
+        else:
+            self._maximized = True
+            self._restore_geo = QRect(self.pos(), self.size())
+            if self._screen is not None:
+                x1, y1, x2, y2 = self._screen.geometry()
+                self.setGeometry(x1 + 8, y1 + 8,
+                                 (x2 - x1 + 1) - 16, (y2 - y1 + 1) - 16)
+            self._max_btn.setText("❐")
+            self._max_btn.setToolTip("还原")
+        self._user_resized = True       # 最大化状态视为用户尺寸，跟随不再改宽
+        self._pinned = True             # 位置也由用户接管
 
     def toggle(self, pet_rect) -> None:
         """右键「历史对话…」：开着就收起，关着就打开。"""

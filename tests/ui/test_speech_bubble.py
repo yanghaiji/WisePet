@@ -119,7 +119,7 @@ def should_accumulate_chunks_when_stream_throttled(bubble, qtbot):
     qtbot.wait(CHUNK_THROTTLE_MS + 30)     # 等节流窗口刷新一次
 
     assert bubble.current_text() == "你好呀"
-    assert bubble.cards[-1].text_label.text() == "你好呀"
+    assert "你好呀" in bubble.cards[-1].text_label.text()
 
 
 def should_replace_with_full_reply_when_stream_done(bubble):
@@ -127,8 +127,43 @@ def should_replace_with_full_reply_when_stream_done(bubble):
     bubble.append_chunk("partial")
     bubble.end_stream("完整回复", anchor=QPoint(400, 300))
 
-    assert bubble.cards[-1].text_label.text() == "完整回复"
+    assert "完整回复" in bubble.cards[-1].text_label.text()
     assert bubble.isVisible()
+
+
+def should_render_markdown_when_assistant_replies(bubble):
+    """AI 回复里的 markdown 要真渲染（加粗/列表），原文仍是 current_text 口径。"""
+    bubble.begin_stream(QPoint(400, 300))
+    bubble.end_stream("**听音乐**\n\n- 甲\n- 乙", anchor=QPoint(400, 300))
+
+    assert bubble.current_text() == "**听音乐**\n\n- 甲\n- 乙"
+    html = bubble.cards[-1].text_label.text()
+    assert "<strong>听音乐</strong>" in html
+    assert "<li>" in html
+    assert "**" not in html                       # 星号标记不能原样露出
+
+
+def should_escape_raw_html_when_ai_outputs_it(bubble):
+    """AI 输出的 HTML 一律转义显示，注入无门。"""
+    bubble.begin_stream(QPoint(400, 300))
+    bubble.end_stream("<script>alert(1)</script>", anchor=QPoint(400, 300))
+
+    html = bubble.cards[-1].text_label.text()
+    assert "&lt;script&gt;" in html and "<script>" not in html
+
+
+def should_keep_user_width_when_grip_dragged(bubble, qtbot):
+    """拖过右下手柄后：宽度记忆生效，流式刷新不覆盖用户的尺寸。"""
+    bubble.begin_stream(QPoint(400, 300))
+    bubble.append_chunk("内容")
+    qtbot.wait(CHUNK_THROTTLE_MS + 30)
+    bubble.resize(500, bubble.height())           # 模拟手柄拖拽
+    bubble._grip.user_resized.emit()
+    bubble.append_chunk("更多内容进来换行也会更长")
+    qtbot.wait(CHUNK_THROTTLE_MS + 30)
+
+    assert bubble.width() == 500                  # 自动布局没有抢回默认宽度
+    assert bubble.cards[-1].raw_text.endswith("更长")
 
 
 def should_follow_unified_duration_when_stream_done(fake_screen, qtbot):

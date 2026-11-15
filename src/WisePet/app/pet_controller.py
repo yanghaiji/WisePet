@@ -8,7 +8,8 @@ from typing import Callable
 
 from ..domain.actions import STATE_TO_ACTION, whole_cycle_duration_s
 from ..domain.config_model import AppConfig
-from ..domain.product import (CONTEXT_REST, CONTEXT_SLEEP, CONTEXT_STRETCH,
+from ..domain.product import (CONTEXT_ENERGIZE, CONTEXT_REST, CONTEXT_SLEEP,
+                              CONTEXT_STRETCH,
                               BehaviorContext, context_hint)
 from ..domain.errors import IllegalTransitionError
 from ..domain.events import (
@@ -42,6 +43,14 @@ PET_HEAD_LINES = (
     "好舒服呀…",
     "你今天也超温柔",
     "被你摸头就满足了",
+)
+
+#: 「叫一声」的回应：用户主动发起，不算主动推送
+USER_CALL_LINES = (
+    "我在呢！一直都在这儿。",
+    "嗯？叫我啦～",
+    "来啦来啦，怎么啦？",
+    "抬头看你一眼：在！",
 )
 
 #: 一次性动作的「至少播多久」（秒）：动画长度量级。ui 的动画播完回调仍先生效，谁先到算谁
@@ -288,7 +297,10 @@ class PetController:
         if hint is CONTEXT_STRETCH:
             self._transition_to(BehaviorState.STRETCHING, autonomous=True)
             return
-        if hint is CONTEXT_SLEEP and is_night:
+        if hint is CONTEXT_ENERGIZE:
+            self._transition_to(BehaviorState.RUNNING, autonomous=True)
+            return
+        if hint is CONTEXT_SLEEP:
             self._transition_to(BehaviorState.SLEEPING, autonomous=True)
             return
         if is_night and self._pet.vitals.energy < cfg.vitals.sad_threshold:
@@ -572,6 +584,34 @@ class PetController:
         self._publish_vitals()
         if self._pet.state not in (BehaviorState.THINKING, BehaviorState.SPEAKING):
             self.speak(self._rng.choice(PET_HEAD_LINES), source="pet")
+
+    def interact(self, kind: str = "pet") -> bool:
+        """用户主动干预：打断当下的自主行为，给出看得见的回应状态。
+
+        - ``pet``（摸一下）：收回走/跑/睡/伸懒腰 → 伸个懒腰蹭回来，心情 +；
+        - ``call``（叫一声）：收回当下动作 → 转过来看着你（SPEAKING）+ 应一声。
+
+        「关系双向」的关键：不是只加心情值或放个固定动画，而是用户真的能改变
+        它此刻在做什么。拖拽中、AI 思考/说话时不打断（手在拖、或在等回复）。
+        返回是否发生了干预。
+        """
+        state = self._pet.state
+        if state in (BehaviorState.DRAGGING, BehaviorState.THINKING,
+                     BehaviorState.SPEAKING):
+            return False
+        self._settle_to_idle_for_conversation(exclude=())
+        if self._pet.state is not BehaviorState.IDLE:
+            return False
+        if kind == "call":
+            self._transition_to(BehaviorState.SPEAKING, autonomous=False)
+            self.speak(self._rng.choice(USER_CALL_LINES), source="pet")
+        else:
+            self._pet.pet_head()
+            self._publish_vitals()
+            self._transition_to(BehaviorState.STRETCHING, autonomous=True)
+            self.speak(self._rng.choice(PET_HEAD_LINES), source="pet")
+        self._reschedule_idle(self._clock.now(), self._config())
+        return True
 
     def speak(self, text: str, source: str = "system") -> None:
         self._bus.publish(SpeakRequestedEvent(text, source=source))

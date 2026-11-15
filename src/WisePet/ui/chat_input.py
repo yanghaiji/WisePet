@@ -9,20 +9,27 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
     QVBoxLayout, QWidget,
 )
 
 from ..domain.attachment import MAX_ATTACHMENTS, Attachment, load_attachment
-from .chat_text_edit import ChatTextEdit, attachment_from_clipboard_image
+from .chat_text_edit import (
+    ChatTextEdit,
+    attachments_from_paths,
+    attachment_from_clipboard_image,
+    local_file_paths,
+)
+from .resize_grip import ResizeGrip
 from .screen_bounds import ScreenBounds
 
 logger = logging.getLogger(__name__)
 
-_INPUT_WIDTH = 400
-_PLACEHOLDER = "和我说点什么…（回车发送，Shift+回车换行）"
+_INPUT_WIDTH = 400              # 默认宽度（用户拖过手柄后按用户宽度走）
+_INPUT_MIN_WIDTH = 280          # 拖窄的下限
+_PLACEHOLDER = "和我说点什么…（回车发送，Shift+回车换行，可拖入文件）"
 
 _PHASE_TEXT = {
     "idle": "随时可以聊",
@@ -52,6 +59,13 @@ QPushButton#attach {
     font-size: 15px; min-width: 26px;
 }
 QPushButton#attach:hover { color: #6B4F3A; }
+QPushButton#winbtn {
+    background: transparent; border: none; color: #A08A6C;
+    font-size: 11px; border-radius: 7px; min-width: 20px; min-height: 20px;
+    padding: 0; color: #B09A7C;
+}
+QPushButton#winbtn:hover { background: #F7EEDC; color: #7A5C3D; }
+QPushButton#winbtn:pressed { background: #EFE0C6; color: #5A3E28; }
 QComboBox {
     background: #FFFFFF; border: 1px solid #E2CFAF; border-radius: 8px;
     padding: 1px 6px; color: #6B4F3A; font-size: 10px;
@@ -93,8 +107,19 @@ class ChatInput(QWidget):
                             | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedWidth(_INPUT_WIDTH)
+        self.setAcceptDrops(True)      # 文件可直接拖进输入条任意位置当附件
+        self.setMinimumWidth(_INPUT_MIN_WIDTH)
         self.setStyleSheet(_STYLE)
+        # 用户拖过手柄 / 切过宽屏后：自动布局不再覆盖用户的宽度选择
+        self._user_resized = False
+        self._wide = False
+        self._restore_size: tuple[int, int] | None = None
+        self._grip = ResizeGrip(self)
+        self._grip.min_size = QSize(_INPUT_MIN_WIDTH, 56)
+        # 输入条高度由「输入框内容」决定，拖高度只会拉出一大片空白：横向专用
+        self._grip.axes = "horizontal"
+        self._grip.setToolTip("左右拖动调整输入条宽度（输入框会跟着变宽）")
+        self._grip.user_resized.connect(self._on_grip_resized)
 
         card = QFrame(self)
         card.setObjectName("inputCard")
@@ -104,6 +129,8 @@ class ChatInput(QWidget):
 
         self._status = QLabel(card)
         self._status.setObjectName("status")
+        # 状态文本允许收缩（窄宽度时截断，详情在 tooltip）：保住「可拖窄到 280」
+        self._status.setMinimumWidth(1)
         self._files = QLabel(card)
         self._files.setObjectName("files")
         self._files.setWordWrap(True)
@@ -114,6 +141,7 @@ class ChatInput(QWidget):
         self._edit.send_requested.connect(self._submit)
         self._edit.dismissed.connect(self._on_dismissed)
         self._edit.image_pasted.connect(self._add_clipboard_image)
+        self._edit.files_dropped.connect(self._add_dropped_files)
         self._edit.textChanged.connect(self._restart_idle_timer)
 
         self._attach_btn = QPushButtonAttach(card)
@@ -132,11 +160,28 @@ class ChatInput(QWidget):
             lambda name: self.model_selected.emit(name))
         model_label = QLabel("模型", card)
         model_label.setObjectName("status")
+        self._min_btn = QPushButton("—", card)
+        self._min_btn.setObjectName("winbtn")
+        self._min_btn.setToolTip("收起输入条（Esc 同效）")
+        self._max_btn = QPushButton("▢", card)
+        self._max_btn.setObjectName("winbtn")
+        self._max_btn.setToolTip("宽屏模式：输入条拉满工作区宽度，再点还原")
+        self._close_btn = QPushButton("×", card)
+        self._close_btn.setObjectName("winbtn")
+        for btn in (self._min_btn, self._max_btn, self._close_btn):
+            btn.setCursor(Qt.PointingHandCursor)
+        self._min_btn.clicked.connect(self._on_dismissed)
+        self._max_btn.clicked.connect(self._toggle_wide)
+        self._close_btn.clicked.connect(self._on_dismissed)
         status_row = QHBoxLayout()
         status_row.setContentsMargins(12, 9, 12, 0)
+        status_row.setSpacing(4)
         status_row.addWidget(self._status, 1)
         status_row.addWidget(model_label, 0)
         status_row.addWidget(self._model_combo, 0)
+        status_row.addWidget(self._min_btn, 0)
+        status_row.addWidget(self._max_btn, 0)
+        status_row.addWidget(self._close_btn, 0)
         files_row = QHBoxLayout()
         files_row.setContentsMargins(12, 2, 12, 0)
         files_row.addWidget(self._files, 1)
@@ -144,6 +189,7 @@ class ChatInput(QWidget):
         input_row.setContentsMargins(9, 5, 9, 9)
         input_row.setSpacing(4)
         input_row.addWidget(self._edit, 1)
+        input_row.addWidget(self._grip, 0, Qt.AlignmentFlag.AlignBottom)
         input_row.addWidget(self._attach_btn, 0, Qt.AlignmentFlag.AlignBottom)
 
         body = QVBoxLayout(card)
@@ -172,12 +218,49 @@ class ChatInput(QWidget):
             self._place(pet_rect)
 
     def _place(self, pet_rect) -> None:
-        self.adjustSize()
+        """贴边定位：宽度默认 400；用户拖过手柄/切过宽屏后尊重用户宽度。"""
+        if self._user_resized or self._wide:
+            self.resize(max(self.width(), _INPUT_MIN_WIDTH),
+                        self.sizeHint().height())
+        else:
+            self.resize(_INPUT_WIDTH, self.sizeHint().height())
         if self._screen is not None:
             x, y = self._screen.place_beside(pet_rect, self.width(), self.height())
         else:
             x, y = pet_rect.left() - self.width() - 12, pet_rect.center().y()
         self.move(x, y)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        """手柄在输入行内随布局走（不再贴窗口角，避免盖住 📎）。"""
+        self._grip.raise_()
+
+    def _on_grip_resized(self) -> None:
+        """手柄拖拽与宽屏模式互斥：拖过之后宽屏状态作废。"""
+        self._user_resized = True
+        self._wide = False
+
+    def _toggle_wide(self) -> None:
+        """宽屏模式：拉满工作区宽度（高度不变），再点还原；互斥于拖拽宽度。"""
+        if self._wide:
+            self._wide = False
+            if self._restore_size is not None:
+                self.resize(*self._restore_size)
+        else:
+            self._wide = True
+            self._restore_size = (self.width(), self.height())
+            if self._screen is not None:
+                x1, _y1, x2, _y2 = self._screen.geometry()
+                self.resize(max((x2 - x1 + 1) - 24, _INPUT_MIN_WIDTH),
+                            self.height())
+        self._place_and_keep()
+        self._edit.setFocus()
+
+    def _place_and_keep(self) -> None:
+        """宽屏切换后重新贴边（沿用最近一次定位的宠物矩形语义：直接按当前锚点）。"""
+        # 没有宠物矩形可拿：保持当前位置，只按新尺寸钳回工作区
+        if self._screen is not None:
+            x, y = self._screen.clamp(self.x(), self.y(), self.width(), self.height())
+            self.move(x, y)
 
     def set_history_count(self, count: int) -> None:
         """状态标签带上一句「已记 N 条」，让保存是否生效一眼可见。"""
@@ -236,6 +319,34 @@ class ChatInput(QWidget):
             return
         self._attachments.append(att)
         self._sync_files_label()
+
+    def _add_dropped_files(self, paths: list[str]) -> None:
+        """拖进来的文件 → 附件（超限/类型错误时提示，已合法的照常收下）。"""
+        attachments, error = attachments_from_paths(paths)
+        if attachments:
+            self._attachments.extend(attachments)
+        self._sync_files_label()
+        if error:                          # 先显示已收下的，再补错误说明
+            # 不能用 isVisible() 判断：窗口隐藏时子控件恒 False，会丢掉已收下附件的提示
+            base = self._files.text()
+            self._files.setText(f"{base} ｜ {error}".strip(" ｜"))
+            self._files.show()
+            self.adjustSize()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        """输入条任意位置（含空白处）都接受文件拖入；输入框由子控件自行处理。"""
+        if local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        paths = local_file_paths(event.mimeData())
+        if paths:
+            self._add_dropped_files(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
     def _pick_files(self) -> None:
         paths, _filter = QFileDialog.getOpenFileNames(

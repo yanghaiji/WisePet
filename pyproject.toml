@@ -1,6 +1,6 @@
 [project]
 name = "WisePet"
-version = "0.1.0"
+version = "3.3.0"
 description = "跨平台桌面宠物：序列帧动画 + 行为状态机 + AI 流式聊天 + 状态心情 + 提醒陪伴"
 requires-python = ">=3.10"
 

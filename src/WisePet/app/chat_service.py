@@ -21,6 +21,7 @@ from ..domain.events import (
     ChatTurnRecordedEvent,
 )
 from ..domain.ports import AIChatGateway, AIConfig
+from .action_protocol import describe_action, parse_action
 from .local_responder import LocalResponder
 
 logger = logging.getLogger(__name__)
@@ -82,13 +83,29 @@ class ChatService:
     def __init__(self, gateway: AIChatGateway, session: ChatSession, bus,
                  config_provider: Callable[[], AIConfig],
                  system_prompt_provider: Callable[[], str],
-                 local_responder: LocalResponder | None = None):
+                 local_responder: LocalResponder | None = None,
+                 tool_runner: (Callable[[str, list[dict], Callable[[str], None] | None],
+                                        object | None] | None) = None,
+                 summary_observer: Callable[[str, str], None] | None = None,
+                 summary_prefix_provider: Callable[[], str | None] | None = None,
+                 ai_allowed_provider: Callable[[], bool] | None = None,
+                 on_ai_request: Callable[[], None] | None = None):
         self._gateway = gateway
         self._session = session
         self._bus = bus
         self._config_provider = config_provider
         self._system_prompt_provider = system_prompt_provider
         self._local = local_responder
+        # 可选的 agent 工具循环：注入后 AI 分支先走 function calling 多步工具，
+        # 返回 None 则沿用原流式纯文本路径；网关不支持 tools 时由 runner 内部降级
+        self._tool_runner = tool_runner
+        # 可选的会话摘要（v1.31）：observer 喂对话流，prefix_provider 给历史前缀
+        self._summary_observer = summary_observer
+        self._summary_prefix = summary_prefix_provider
+        # 可选的 AI 配额（v1.32）：allowed=False 时 AI 分支回落本地小脑；
+        # 每次真正发出 AI 请求时计数（家庭场景防过度消费）
+        self._ai_allowed = ai_allowed_provider
+        self._on_ai_request = on_ai_request
         self._queue: deque[str] = deque()
         self._cancelled = False
         #: 只为日志能把「一次请求」与「一条回复」串起来，不代表业务语义
@@ -109,6 +126,8 @@ class ChatService:
         if not stripped and not attachments:
             return False
         self._session.add_turn("user", stripped or "[附件]")
+        if self._summary_observer is not None and stripped:
+            self._summary_observer("user", stripped)   # 摘要缓冲（v1.31）
         self._queue.append((stripped, attachments))
         ts = time.time()
         sid = day_key(ts)
@@ -158,7 +177,15 @@ class ChatService:
         if source == "local":
             self._reply_locally(text, seq, source)
             return True
+        if self._ai_allowed is not None and not self._ai_allowed():
+            self._reply_locally(text, seq, source, quota_hit=True)
+            return True
         messages = self._session.build_messages(self._system_prompt_provider())
+        # 会话摘要前缀（v1.31）：被截断的旧对话以一段记忆的形式保留在场
+        if self._summary_prefix is not None:
+            prefix = self._summary_prefix()
+            if prefix:
+                messages.insert(1, {"role": "system", "content": prefix})
         if attachments:
             messages[-1] = _multimodal_message(text, attachments)
         prompt_chars = sum(len(str(m.get("content") or "")) for m in messages)
@@ -168,6 +195,13 @@ class ChatService:
         started = time.monotonic()
         parts: list[str] = []
         first_wait = None  # 首段上屏等了多久：“半天不出字”与“出字慢”靠它区分
+        if self._on_ai_request is not None:
+            self._on_ai_request()               # 家庭配额计数（每轮 1 次）
+        # 轴②：agent 工具循环（function calling 多步）。返回 None 表示不走 agent
+        # （总开关关闭 / 网关已降级），继续沿用下面的纯文本流式 + JSON 协议兜底。
+        if self._tool_runner is not None and self._try_agent(
+                self._tool_runner, text, messages, seq, source, started):
+            return True
         try:
             for chunk in self._gateway.stream_chat(messages, cfg):
                 if self._cancelled:
@@ -179,10 +213,22 @@ class ChatService:
                 parts.append(chunk)
                 self._bus.publish(ChatReplyChunkEvent(text_delta=chunk))
             reply = "".join(parts)
+            pending = None
             if reply:
+                # JSON 协议兜底：模型回的是动作指令时，落盘/回灌/摘要全部用
+                # 人话规范形——原始 JSON 一旦进历史，回灌后会持续污染模型
+                #（它会把 JSON 当成「正确回复样例」继续输出，见 v1.32 真机反馈）
+                action = parse_action(reply)
+                if action is not None:
+                    pending = action
+                    reply = f"好的，{describe_action(action)}～"
                 self._session.add_turn("assistant", reply)
                 self._publish_turn("assistant", reply, source)
-            self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True, reply=reply))
+                if self._summary_observer is not None:
+                    self._summary_observer("assistant", reply)   # 摘要缓冲（v1.31）
+            self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True,
+                                                  reply=reply,
+                                                  pending_action=pending))
             self._publish_phase(PHASE_DONE, source)
             logger.info(
                 "chat #%d source=ai done chunks=%d reply_chars=%d first_chunk=%s "
@@ -207,20 +253,83 @@ class ChatService:
         self._publish_phase(PHASE_ERROR, source, detail=kind)
         self._publish_turn("assistant", self.fallback_text(kind), "fallback")
 
-    def _reply_locally(self, text: str, seq: int, source: str = "local") -> None:
-        """未配 AI Key 时的本地模式：规则回复 + 拟流式投递，不当成错误处理。
+    def _try_agent(self, runner, text: str, messages: list[dict],
+                   seq: int, source: str, started: float) -> bool:
+        """尝试 agent 工具循环；返回 True 表示已完整处理（含 done 事件）。
+
+        多步工具在 worker 线程内同步执行（只读工具 + 排期），写盘动作作为
+        pending_action 事件交给主线程走既有确认链路——安全边界不因 agent 放宽。
+        模型输出经 on_content 增量实时上屏（真流式）；工具循环中途的过渡语
+        （如「让我查一下」）也会先露出。若网关不支持流式工具协议（一段增量
+        都没发过），回落 stream_pieces 拟流式。用户取消时仍发完整 done。
+        """
+        live = {"chars": 0, "replying": False}
+
+        def on_content(delta: str) -> None:
+            if not live["replying"]:
+                self._publish_phase(PHASE_REPLYING, source)
+                live["replying"] = True
+            live["chars"] += len(delta)
+            self._bus.publish(ChatReplyChunkEvent(text_delta=delta))
+
+        try:
+            outcome = runner(text, messages, on_content)
+        except AIGatewayError as exc:
+            logger.warning("chat #%d agent failed [%s]: %s", seq, exc.kind, exc.detail)
+            self._bus.publish(ChatErrorEvent(kind=exc.kind, detail=exc.detail))
+            self._on_failure(exc.kind, source)
+            return True
+        except Exception:  # noqa: BLE001 - 兜底未知异常，保证不崩
+            logger.exception("chat #%d agent unexpected failure", seq)
+            self._bus.publish(ChatErrorEvent(kind=AIGatewayError.SERVER,
+                                             detail="unexpected"))
+            self._on_failure(AIGatewayError.SERVER, source)
+            return True
+        if outcome is None:
+            return False                 # 开关关闭 / 已降级：走原纯文本流式
+        reply = str(outcome.final_text or "")
+        if not live["chars"]:
+            # 没收到过任何增量（网关不支持流式 / 无工具内容）：拟流式整段外发
+            self._publish_phase(PHASE_REPLYING, source)
+            for piece in stream_pieces(reply):
+                if self._cancelled:
+                    logger.info("chat #%d agent cancelled by user", seq)
+                    break
+                self._bus.publish(ChatReplyChunkEvent(text_delta=piece))
+        if reply:
+            self._session.add_turn("assistant", reply)
+            self._publish_turn("assistant", reply, source)
+            if self._summary_observer is not None:
+                self._summary_observer("assistant", reply)
+        self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True, reply=reply,
+                                              pending_action=outcome.pending_action))
+        self._publish_phase(PHASE_DONE, source)
+        logger.info(
+            "chat #%d agent done steps=%d tools=%s reply_chars=%d elapsed=%.2fs"
+            " preview=%s",
+            seq, outcome.steps, ",".join(outcome.tools_used) or "-",
+            len(reply), time.monotonic() - started, _preview(reply))
+        return True
+
+    def _reply_locally(self, text: str, seq: int, source: str = "local",
+                       quota_hit: bool = False) -> None:
+        """未配 AI Key / 配额用尽时的本地模式：规则回复 + 拟流式投递，不当成错误。
 
         本地回复是纯计算、瞬间完成，因此不检查 _cancelled（避免漏发 done 事件
         让 ui 永远停在流式状态）。
         """
         started = time.monotonic()
         reply = self._local.reply(text)
+        if quota_hit:
+            reply = "（今天 AI 次数用完啦，先本地陪你聊～）" + reply
         for index, piece in enumerate(stream_pieces(reply)):
             if index == 0:
                 self._publish_phase(PHASE_REPLYING, source)
             self._bus.publish(ChatReplyChunkEvent(text_delta=piece))
         self._session.add_turn("assistant", reply)
         self._publish_turn("assistant", reply, source)
+        if self._summary_observer is not None:
+            self._summary_observer("assistant", reply)   # 摘要缓冲（v1.31）
         self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True, reply=reply))
         self._publish_phase(PHASE_DONE, source)
         logger.info("chat #%d source=local intent=%s reply_chars=%d elapsed=%.2fs preview=%s",

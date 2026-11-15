@@ -35,6 +35,9 @@ class ChatReplyChunkEvent:
     text_delta: str
     done: bool = False
     reply: str = ""  # done=True 时的完整回复
+    # agent 工具循环产出的待确认动作（写盘/排期）；done=True 时可能携带，
+    # 主线程据此走既有的三级权限 + 预览确认 + 审计链路
+    pending_action: object | None = None
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,9 @@ ACTION_PROMPT_GUIDE = """
 - 创建/写入文件 → 输出 {"action":"create_file",...}
 - 生成PPT → 输出 {"action":"make_ppt",...}
 需要执行时，你这条回复**只能**是一个 ```json 代码块，禁止输出安慰、解释或表情等任何
-其他文字（执行结果由程序反馈给用户）。不需要执行时，忽略本协议正常聊天。格式：
+其他文字（执行结果由程序反馈给用户）。**只在用户的这条消息明确要求执行操作时才输出
+JSON**——打招呼、闲聊、提问、抱怨、拒绝（如「我也没说要…」）一律正常聊天，禁止输出
+JSON。不需要执行时，忽略本协议正常聊天。格式：
 {"action":"remind","delay_min":5,"text":"开会"}    （N 分钟后提醒；或用 "at_hm":"14:30" 指定时刻）
 {"action":"create_file","path":"D:/notes/a.md","content":"文件完整内容"}
 {"action":"make_ppt","path":"D:/demo.pptx","title":"演示标题","slides":[{"title":"页标题","bullets":["要点1","要点2"]}]}

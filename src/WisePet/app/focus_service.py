@@ -49,6 +49,7 @@ class FocusService:
         self._due_at: float | None = None
         self._started_at: float | None = None
         self._minutes: float = 0.0
+        self._last_finished_at: float | None = None
 
     # ---------- 状态 ----------
 
@@ -62,7 +63,17 @@ class FocusService:
             return 0.0
         return max(0.0, (self._due_at - self._clock.now()) / _SECONDS_PER_MINUTE)
 
+    def just_finished(self, window_s: float = 300.0) -> bool:
+        """刚完成一轮专注（默认 5 分钟内）：给行为与话术一个「刚打完硬仗」的情境。"""
+        if self._last_finished_at is None:
+            return False
+        return 0.0 <= self._clock.now() - self._last_finished_at <= window_s
+
     # ---------- 命令 ----------
+
+    def note_finished(self, now: float) -> None:
+        """供外部（如命令面板手动结束）登记完成时刻；正常到期由 tick 自动登记。"""
+        self._last_finished_at = now
 
     def start(self, minutes: float = DEFAULT_FOCUS_MIN) -> float:
         """开始一轮专注；重复调用视为重新计时。返回结束时刻。"""
@@ -86,6 +97,7 @@ class FocusService:
         if self._due_at is None or now < self._due_at:
             return
         self._due_at = None
+        self.note_finished(now)
         self._log_session()
         self._bus.publish(SpeakRequestedEvent(
             f"专注 {self._minutes:.0f} 分钟完成，起来伸个懒腰、喝口水吧！",

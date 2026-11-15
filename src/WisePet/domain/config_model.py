@@ -36,12 +36,13 @@ class AIProfile:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    embedding_model: str = ""   # 语义检索用的 embedding 模型（留空禁用）
 
     @classmethod
     def from_ai(cls, ai) -> "AIProfile":
         """把当前生效的 AIConfig 快照成一个方案（旧配置升级入口）。"""
-        return cls(name="默认", base_url=ai.base_url,
-                   api_key=ai.api_key, model=ai.model)
+        return cls(name="默认", base_url=ai.base_url, api_key=ai.api_key,
+                   model=ai.model, embedding_model=ai.embedding_model)
 
 
 @dataclass
@@ -61,6 +62,7 @@ class PetParams:
     max_turns: int = 20                 # 会话保留轮数（PRD US-3）
     click_move_threshold_px: int = 5    # 区分点击与拖拽的位移阈值
     activity: str = "normal"            # 活泼度：quiet / normal / lively，缩放自主行为间隔
+    enter_effect: str = "auto"          # 登场特效：auto / random / 7 种具体 kind
 
 
 @dataclass
@@ -167,9 +169,14 @@ class BehaviorSettings:
 
 @dataclass
 class MemorySettings:
-    """长期记忆与跨日检索：只落本机，不上传（隐私卖点的护城河）。"""
+    """长期记忆与跨日检索：只落本机，不上传（隐私卖点的护城河）。
+
+    fact_ttl_days = 0 表示永不衰减（交给 agent 工具检索，而不是替 AI 丢记忆）。
+    """
     enabled: bool = True
-    search_max_results: int = 50
+    search_max_results: int = 200
+    summary_enabled: bool = True   # 会话摘要：被截断的旧对话压缩成一段记忆
+    fact_ttl_days: int = 365       # 自由事实多少天后不再进提示词（0 = 永不）
 
 
 @dataclass
@@ -207,6 +214,68 @@ class DndSettings:
 
 
 @dataclass
+class CompanionSettings:
+    """关系感（陪伴轴）：惦记 / 情境 / 可干预 / 久别重逢，全部基于本机事实。
+
+    总开关 enabled 一关，四项行为整体退回旧版，方便用户按隐私偏好取舍。
+    """
+    enabled: bool = True
+    recall_enabled: bool = True          # 主动提起还没兑现的惦记
+    memory_prompt_enabled: bool = True   # 把惦记注入系统提示词（与推送分开控制）
+    contextual: bool = True              # 周一早晨/深夜/刚结束专注影响动作与话术
+    interactive: bool = True             # 摸一下/叫一声能打断当下状态
+    reunion_enabled: bool = True         # 久别重逢问候
+    reunion_min_hours: float = 20.0      # 超过这么久才算「久别」
+    recall_lookback_days: int = 14       # 惦记回看窗口（天）
+    max_recalls: int = 3                 # 同时惦记的条数上限（清单化）
+
+
+@dataclass
+class WebSearchSettings:
+    """联网搜索：agent 的 web_search 工具用什么后端查网页。
+
+    provider = bing（免 Key，国内直连，默认）/ duckduckgo / tavily / bocha。
+    amap_key = 高德 Web 服务 Key（填了才解锁 nearby_pois 周边搜索）。
+    """
+    enabled: bool = True
+    provider: str = "bing"
+    api_key: str = ""
+    max_results: int = 5
+    amap_key: str = ""
+
+
+@dataclass
+class LocationSettings:
+    """位置权限：get_location 工具（IP 城市级定位）的授权状态。
+
+    consent = ask（每次弹窗问）/ granted（总是允许）/ denied（不允许）。
+    """
+    enabled: bool = True
+    consent: str = "ask"
+
+
+@dataclass
+class AssistantSettings:
+    """轴②助理能力：可托付任务 / 本地资料索引 / 事件驱动主动（全部本机、零联网）。
+
+    资料索引默认关闭且目录为空——必须由用户显式指定文件夹才读任何文件。
+    """
+    enabled: bool = True                 # 总开关：一关三项整体停用
+    tool_calling_enabled: bool = True    # 原生 function calling（tools 协议）+ 多步工具循环
+    use_family_ai: bool = True           # 跟随管理员共享的 AI（默认一家人共用；取消则用下面自己的 Key）
+    share_family_ai: bool = False        # 管理员专属：把本身份的 AI 共享给全家
+    daily_ai_limit: int = 0              # 本身份每天最多几次 AI 请求（0 = 不限；防过度消费）
+    tasks_enabled: bool = True           # 助理任务队列
+    task_poll_s: float = 30.0            # 盯文件的最小轮询间隔
+    knowledge_enabled: bool = False      # 本地文档 RAG
+    knowledge_dir: str = ""              # 用户显式指定的资料文件夹
+    knowledge_top_k: int = 3             # 每次注入几个片段
+    semantic_search: bool = False        # 语义检索（需 ai.embedding_model；混合 BM25）
+    events_enabled: bool = True          # 事件驱动主动
+    event_daily_limit: int = 2           # 每天最多几条情境推送（有分寸）
+
+
+@dataclass
 class ReminderSettings:
     water: ReminderItem = field(default_factory=lambda: ReminderItem(True, 45.0))
     sedentary: ReminderItem = field(default_factory=lambda: ReminderItem(True, 60.0))
@@ -237,6 +306,10 @@ class AppConfig:
     memory: MemorySettings = field(default_factory=MemorySettings)
     actions: ActionSettings = field(default_factory=ActionSettings)
     system: SystemSettings = field(default_factory=SystemSettings)
+    companion: CompanionSettings = field(default_factory=CompanionSettings)
+    assistant: AssistantSettings = field(default_factory=AssistantSettings)
+    web_search: WebSearchSettings = field(default_factory=WebSearchSettings)
+    location: LocationSettings = field(default_factory=LocationSettings)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -255,6 +328,7 @@ class AppConfig:
             model=str(ai_d.get("model") or defaults.ai.model),
             temperature=_num(ai_d.get("temperature"), defaults.ai.temperature),
             timeout_s=_num(ai_d.get("timeout_s"), defaults.ai.timeout_s),
+            embedding_model=str(ai_d.get("embedding_model") or ""),
         )
         profiles = _parse_profiles(data.get("ai_profiles"), ai)
         p_d = data.get("persona") or {}
@@ -267,6 +341,10 @@ class AppConfig:
             skin=normalize_skin(pet_d.get("skin")),
             activity=_choice(pet_d.get("activity"), defaults.pet.activity,
                              ("quiet", "normal", "lively")),
+            enter_effect=_choice(pet_d.get("enter_effect"),
+                                 defaults.pet.enter_effect,
+                                 ("auto", "random", "spawn", "burst", "puzzle",
+                                  "terminal", "curtain", "ink", "magnifier")),
             walk_speed_px_per_s=_num(pet_d.get("walk_speed_px_per_s"), defaults.pet.walk_speed_px_per_s),
             run_speed_px_per_s=_num(pet_d.get("run_speed_px_per_s"), defaults.pet.run_speed_px_per_s),
             idle_min_s=_num(pet_d.get("idle_min_s"), defaults.pet.idle_min_s),
@@ -393,6 +471,10 @@ class AppConfig:
             enabled=_bool(m_d.get("enabled"), defaults.memory.enabled),
             search_max_results=_int_clamp(m_d.get("search_max_results"),
                                           defaults.memory.search_max_results, 5, 500),
+            summary_enabled=_bool(m_d.get("summary_enabled"),
+                                  defaults.memory.summary_enabled),
+            fact_ttl_days=int(_int_clamp(m_d.get("fact_ttl_days"),
+                                         defaults.memory.fact_ttl_days, 0, 3650)),
         )
         a_d = data.get("actions") or {}
         actions = ActionSettings(
@@ -413,12 +495,75 @@ class AppConfig:
             log_split_by_level=_bool(s_d.get("log_split_by_level"),
                                      defaults.system.log_split_by_level),
         )
+        c_d = data.get("companion") or {}
+        companion = CompanionSettings(
+            enabled=_bool(c_d.get("enabled"), defaults.companion.enabled),
+            recall_enabled=_bool(c_d.get("recall_enabled"),
+                                 defaults.companion.recall_enabled),
+            memory_prompt_enabled=_bool(c_d.get("memory_prompt_enabled"),
+                                        defaults.companion.memory_prompt_enabled),
+            contextual=_bool(c_d.get("contextual"), defaults.companion.contextual),
+            interactive=_bool(c_d.get("interactive"), defaults.companion.interactive),
+            reunion_enabled=_bool(c_d.get("reunion_enabled"),
+                                  defaults.companion.reunion_enabled),
+            reunion_min_hours=min(720.0, max(1.0, _num(
+                c_d.get("reunion_min_hours"), defaults.companion.reunion_min_hours))),
+            recall_lookback_days=int(_int_clamp(
+                c_d.get("recall_lookback_days"),
+                defaults.companion.recall_lookback_days, 1, 90)),
+            max_recalls=int(_int_clamp(c_d.get("max_recalls"),
+                                       defaults.companion.max_recalls, 1, 10)),
+        )
+        a2_d = data.get("assistant") or {}
+        assistant = AssistantSettings(
+            enabled=_bool(a2_d.get("enabled"), defaults.assistant.enabled),
+            tool_calling_enabled=_bool(a2_d.get("tool_calling_enabled"),
+                                       defaults.assistant.tool_calling_enabled),
+            use_family_ai=_bool(a2_d.get("use_family_ai"),
+                                defaults.assistant.use_family_ai),
+            share_family_ai=_bool(a2_d.get("share_family_ai"),
+                                  defaults.assistant.share_family_ai),
+            daily_ai_limit=int(_int_clamp(a2_d.get("daily_ai_limit"),
+                                          defaults.assistant.daily_ai_limit, 0, 500)),
+            tasks_enabled=_bool(a2_d.get("tasks_enabled"),
+                                defaults.assistant.tasks_enabled),
+            task_poll_s=min(600.0, max(10.0, _num(
+                a2_d.get("task_poll_s"), defaults.assistant.task_poll_s))),
+            knowledge_enabled=_bool(a2_d.get("knowledge_enabled"),
+                                    defaults.assistant.knowledge_enabled),
+            knowledge_dir=str(a2_d.get("knowledge_dir") or "")[:500],
+            knowledge_top_k=int(_int_clamp(a2_d.get("knowledge_top_k"),
+                                           defaults.assistant.knowledge_top_k, 1, 8)),
+            semantic_search=_bool(a2_d.get("semantic_search"),
+                                  defaults.assistant.semantic_search),
+            events_enabled=_bool(a2_d.get("events_enabled"),
+                                 defaults.assistant.events_enabled),
+            event_daily_limit=int(_int_clamp(a2_d.get("event_daily_limit"),
+                                             defaults.assistant.event_daily_limit, 0, 10)),
+        )
+        w_d = data.get("web_search") or {}
+        web_search = WebSearchSettings(
+            enabled=_bool(w_d.get("enabled"), defaults.web_search.enabled),
+            provider=_choice(w_d.get("provider"), defaults.web_search.provider,
+                             ("bing", "duckduckgo", "tavily", "bocha")),
+            api_key=str(w_d.get("api_key") or ""),
+            max_results=_int_clamp(w_d.get("max_results"),
+                                   defaults.web_search.max_results, 1, 10),
+            amap_key=str(w_d.get("amap_key") or ""),
+        )
+        l_d = data.get("location") or {}
+        location = LocationSettings(
+            enabled=_bool(l_d.get("enabled"), defaults.location.enabled),
+            consent=_choice(l_d.get("consent"), defaults.location.consent,
+                            ("ask", "granted", "denied")),
+        )
         return cls(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                    vitals=vitals, reminders=reminders, news=news, cheer=cheer,
                    bubble=bubble, chat=chat, focus=focus, dnd=dnd,
                    tts=tts, notification=notification, weekly=weekly, growth=growth,
                    quiet=quiet, behavior=behavior, memory=memory, actions=actions,
-                   system=system)
+                   system=system, companion=companion, assistant=assistant,
+                   web_search=web_search, location=location)
 
 
 def _parse_profiles(raw, ai: AIConfig) -> list:
@@ -434,7 +579,8 @@ def _parse_profiles(raw, ai: AIConfig) -> list:
         profiles.append(AIProfile(
             name=name, base_url=base_url,
             api_key=str(item.get("api_key") or ""),
-            model=str(item.get("model") or ai.model)))
+            model=str(item.get("model") or ai.model),
+            embedding_model=str(item.get("embedding_model") or "")))
     if not profiles:
         profiles = [AIProfile.from_ai(ai)]
     # 当前生效的 ai 必须在方案列表里有一席：缺失时把当前配置补录进去

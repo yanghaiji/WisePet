@@ -22,14 +22,25 @@ class FakeClock:
 
 
 class FakeGateway:
-    """记录调用参数的流式网关替身（error 可为任意异常，用于验证兜底）。"""
+    """记录调用参数的流式网关替身（error 可为任意异常，用于验证兜底）。
+
+    tools_results：chat_with_tools 的预设返回序列（每项 (content, tool_calls)）；
+    tools_error：chat_with_tools 抛出的异常（模拟网关不支持 tools 协议）。
+    """
 
     def __init__(self, chunks=(), error: Exception | None = None,
-                 before_first_chunk=None):
+                 before_first_chunk=None, tools_results=(),
+                 tools_error: Exception | None = None,
+                 complete_reply: str = "好的"):
         self._chunks = list(chunks)
         self._error = error
         self.before_first_chunk = before_first_chunk
+        self.tools_results = list(tools_results)
+        self.tools_error = tools_error
+        self.complete_reply = complete_reply
         self.calls: list[tuple] = []
+        self.tool_calls: list[tuple] = []
+        self.completes: list[tuple] = []
 
     def stream_chat(self, messages, cfg):
         self.calls.append((messages, cfg))
@@ -39,6 +50,25 @@ class FakeGateway:
             self.before_first_chunk()
         for chunk in self._chunks:
             yield chunk
+
+    def chat_with_tools(self, messages, cfg, tools):
+        self.tool_calls.append((messages, cfg, list(tools)))
+        if self.tools_error is not None:
+            raise self.tools_error
+        if not self.tools_results:
+            raise AssertionError("FakeGateway.tools_results 已耗尽")
+        return self.tools_results.pop(0)
+
+    def complete(self, messages, cfg):
+        """与真实网关同形的非流式接口：后台任务（问候/鼓励/摘要）用。
+
+        存在意义：v1.30 曾因 complete 委托漏传参数、且替身无此方法导致
+        全部后台任务在真机失败而测试全绿——协议完整性必须落在替身上。
+        """
+        self.completes.append((messages, cfg))
+        if self._error is not None:
+            raise self._error
+        return self.complete_reply
 
 
 class FakeFullscreenDetector:

@@ -14,14 +14,23 @@ class AIConfig:
     model: str = "gpt-4o-mini"
     temperature: float = 0.8
     timeout_s: float = 30.0
+    embedding_model: str = ""   # 留空 = 不启用语义检索（资料索引纯关键词）
 
     @property
     def chat_endpoint(self) -> str:
         return self.base_url.rstrip("/") + "/chat/completions"
 
     @property
+    def embedding_endpoint(self) -> str:
+        return self.base_url.rstrip("/") + "/embeddings"
+
+    @property
     def configured(self) -> bool:
         return bool(self.api_key.strip())
+
+    @property
+    def semantic_ready(self) -> bool:
+        return bool(self.api_key.strip() and self.embedding_model.strip())
 
 
 @runtime_checkable

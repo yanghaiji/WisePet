@@ -24,9 +24,11 @@ from WisePet.domain.pet import Pet
 from WisePet.domain.position import PositionVO
 from WisePet.domain.state_machine import BehaviorState
 from WisePet.domain.vitals import VitalsVO
+from WisePet.infra.ai_stores import SharedAIStore
 from WisePet.infra.config_repo import JsonConfigRepository
 from WisePet.infra.pet_state_repo import PetStateRepository
 from WisePet.ui.screen_bounds import ScreenBounds
+from WisePet.ui.tech_effects import ENTER_KINDS
 from fakes import FakeClock
 
 
@@ -36,7 +38,8 @@ def _build(qapp, tmp_path, assets_dir, clock=None, tray_available=None):
                                state_repo=PetStateRepository(tmp_path),
                                assets_dir=assets_dir,
                                clock=clock or FakeClock(),
-                               tray_available=tray_available)
+                               tray_available=tray_available,
+                               shared_ai=SharedAIStore(tmp_path))
 
 
 @pytest.fixture
@@ -456,6 +459,16 @@ def should_stop_worker_and_save_state_when_shutdown(qapp, tmp_path, assets_dir, 
     assert PetStateRepository(tmp_path).load().pet_id == main.PET_ID
 
 
+def should_inject_long_term_facts_at_prompt_tail(pet_app):
+    """AI 抽取的事实要作为权威事实出现在系统提示词末尾，换问法也能答上来。"""
+    pet_app._memory.remember("名字", "a")
+    pet_app._memory.remember("忌口", "不吃香菜")
+    prompt = pet_app._system_prompt()
+    assert "【长期记忆 · 权威事实】" in prompt
+    assert "名字：a" in prompt and "不吃香菜" in prompt
+    assert prompt.index("【长期记忆 · 权威事实】") > prompt.index("小墨")
+
+
 def should_log_chat_brain_local_when_started_without_key(pet_app, caplog):
     """启动就说清“回复由谁作答”：本地小脑也逐段上屏，看气泡分不出来源。"""
     with caplog.at_level(logging.INFO):
@@ -768,3 +781,88 @@ class TestStartupGreeting:
         pet_app.start()
 
         assert called
+
+
+class TestEnterEffectRandom:
+    """「隐藏/出现也要随机」+ 随机模式：从托盘恢复随机、random 配置每次随机，且都排除丑的水墨。"""
+
+    def _set_effect(self, pet_app, value):
+        pet_app._config = replace(pet_app._config,
+                                  pet=replace(pet_app._config.pet, enter_effect=value))
+
+    def should_randomize_toggle_under_auto(self, pet_app):
+        self._set_effect(pet_app, "auto")
+        seen = {pet_app._enter_kind_for("toggle") for _ in range(40)}
+        assert seen <= set(ENTER_KINDS)
+        assert seen  # 多次抽样应覆盖多种（否则随机等于定值，无意义）
+
+    def should_random_mode_returns_valid_kinds(self, pet_app):
+        self._set_effect(pet_app, "random")
+        for trigger in ("boot", "toggle", "chat", "scene", "celebrate"):
+            assert pet_app._enter_kind_for(trigger) in ENTER_KINDS
+
+    def should_fixed_kind_still_respected(self, pet_app):
+        self._set_effect(pet_app, "puzzle")
+        for trigger in ("boot", "toggle", "chat", "scene", "celebrate"):
+            assert pet_app._enter_kind_for(trigger) == "puzzle"
+
+    def should_auto_non_toggle_triggers_stay_fixed(self, pet_app):
+        self._set_effect(pet_app, "auto")
+        # 除 toggle 外，auto 仍按场景固定、可解释
+        assert pet_app._enter_kind_for("boot") == "spawn"
+        assert pet_app._enter_kind_for("chat") == "terminal"
+        assert pet_app._enter_kind_for("scene") == "curtain"
+        assert pet_app._enter_kind_for("celebrate") == "burst"
+
+
+class TestEnterEffectFollowsTrigger:
+    """进入特效「随触发」：宠物可见时触发动作也播放对应特效，且不再隐藏重入。
+
+    这是修复「只看到开机/恢复两种」的关键——日常宠物一直可见，触发 chat/scene/
+    celebrate 必须作为反馈层播放对应风格特效，而不是因为「已可见」就整段跳过。
+    """
+
+    def _spy(self, pet_app, monkeypatch):
+        calls = []
+        monkeypatch.setattr(pet_app, "_play_effect_only",
+                            lambda t: calls.append(("overlay", t)))
+        monkeypatch.setattr(pet_app, "_enter_pet",
+                            lambda t, after=None: calls.append(("enter", t)))
+        return calls
+
+    def should_play_overlay_when_pet_visible_on_scene(self, pet_app, monkeypatch):
+        pet_app.window.setVisible(True)
+        calls = self._spy(pet_app, monkeypatch)
+
+        pet_app._run_command("scene_healthy")
+
+        assert ("overlay", "scene") in calls
+        assert not any(c[0] == "enter" for c in calls)
+        assert pet_app.window.isVisible()        # 宠物没被隐藏重入
+
+    def should_play_overlay_when_pet_visible_on_chat(self, pet_app, monkeypatch):
+        pet_app.window.setVisible(True)
+        calls = self._spy(pet_app, monkeypatch)
+
+        pet_app._run_command("chat")
+
+        assert ("overlay", "chat") in calls
+        assert not any(c[0] == "enter" for c in calls)
+
+    def should_play_overlay_when_pet_visible_on_reminder(self, pet_app, monkeypatch):
+        pet_app.window.setVisible(True)
+        calls = self._spy(pet_app, monkeypatch)
+
+        pet_app._run_command("reminder")
+
+        assert ("overlay", "celebrate") in calls
+        assert not any(c[0] == "enter" for c in calls)
+
+    def should_enter_when_pet_hidden(self, pet_app, monkeypatch):
+        pet_app.window.setVisible(False)
+        calls = self._spy(pet_app, monkeypatch)
+
+        pet_app._run_command("scene_deep")
+
+        assert ("enter", "scene") in calls
+        assert not any(c[0] == "overlay" for c in calls)

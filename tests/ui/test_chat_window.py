@@ -17,6 +17,30 @@ def _record(role, content, source="", ts=1_700_000_000.0):
                       session_id=day_key(ts))
 
 
+class TestMarkdownRendering:
+    """v1.33 打磨：助手消息完整渲染 markdown，用户消息保持纯文本。"""
+
+    def should_render_markdown_for_assistant_record(self):
+        html = _bubble_html(_record("assistant", "# 标题\n**加粗**\n\n- 项", "ai"))
+        assert "<h1" in html
+        assert "<strong>加粗</strong>" in html
+        assert "<li>项</li>" in html
+        assert "**加粗**" not in html          # 星号标记不能原样露出
+
+    def should_escape_raw_html_for_assistant_record(self):
+        html = _bubble_html(_record("assistant", "<script>x</script>", "ai"))
+        assert "&lt;script&gt;" in html and "<script>" not in html
+
+    def should_keep_user_content_plain(self):
+        html = _bubble_html(_record("user", "**不解释**", "user"))
+        assert "**不解释**" in html          # 用户原文原样（转义后）
+        assert "<strong>" not in html
+
+    def should_render_table_and_code_block(self):
+        html = _bubble_html(_record("assistant", "```py\nprint(1)\n```", "ai"))
+        assert "<pre" in html and "print(1)" in html
+
+
 @pytest.fixture
 def chat_window(qtbot, fake_screen):
     widget = ChatWindow(fake_screen,
@@ -24,6 +48,67 @@ def chat_window(qtbot, fake_screen):
                         records_provider=lambda _day: [_record("user", "昨天的问候", "user")])
     qtbot.addWidget(widget)
     return widget
+
+
+class TestFileDrop:
+    """v1.33 打磨：文件拖进输入框/窗口 → 走附件链路（与 📎 按钮同一汇合点）。"""
+
+    def should_turn_dropped_paths_into_attachments(self, chat_window, tmp_path):
+        target = tmp_path / "拖进来的.txt"
+        target.write_text("内容", encoding="utf-8")
+        chat_window._add_dropped_files([str(target)])
+        taken = chat_window.take_attachments()
+        assert len(taken) == 1 and taken[0].name == "拖进来的.txt"
+
+    def should_report_error_and_keep_valid_ones(self, chat_window, tmp_path):
+        good = tmp_path / "good.txt"
+        good.write_text("内容", encoding="utf-8")
+        bad = tmp_path / "bad.exe"        # 不在支持类型里
+        bad.write_text("x", encoding="utf-8")
+        chat_window._add_dropped_files([str(good), str(bad)])
+        taken = chat_window.take_attachments()
+        assert [a.name for a in taken] == ["good.txt"]
+        assert "一次最多" not in chat_window._files.text()
+
+    def should_respect_attachment_limit_when_dropped(self, chat_window, tmp_path,
+                                                     monkeypatch):
+        from WisePet.domain.attachment import MAX_ATTACHMENTS
+        monkeypatch.setattr("WisePet.ui.chat_text_edit.MAX_ATTACHMENTS", 1)
+        one = tmp_path / "one.txt"
+        one.write_text("1", encoding="utf-8")
+        two = tmp_path / "two.txt"
+        two.write_text("2", encoding="utf-8")
+        chat_window._add_dropped_files([str(one), str(two)])
+        # 先断言提示（take_attachments 会清空文件标签），再取走附件
+        assert "一次最多 1 个附件" in chat_window._files.text()
+        assert "one.txt" in chat_window._files.text()
+        taken = chat_window.take_attachments()
+        assert [a.name for a in taken] == ["one.txt"]
+
+
+class TestWindowControls:
+    """v1.33 打磨：— ▢ × 控制按钮；最大化铺满工作区、还原到之前几何。"""
+
+    def should_have_window_control_buttons(self, chat_window):
+        assert chat_window._min_btn.text() == "—"
+        assert chat_window._max_btn.text() == "▢"
+        assert chat_window._close_btn.text() == "×"
+
+    def should_maximize_fill_workarea_and_restore(self, chat_window, fake_screen):
+        x1, y1, x2, y2 = fake_screen.geometry()
+        before = QRect(chat_window.pos(), chat_window.size())
+        chat_window._max_btn.click()
+        assert chat_window._maximized
+        assert chat_window.x() == x1 + 8 and chat_window.y() == y1 + 8
+        assert chat_window.width() == (x2 - x1 + 1) - 16
+        chat_window._max_btn.click()               # 还原
+        assert not chat_window._maximized
+        assert QRect(chat_window.pos(), chat_window.size()) == before
+
+    def should_hide_when_minimize_clicked(self, chat_window):
+        chat_window.show()
+        chat_window._min_btn.click()
+        assert not chat_window.isVisible()
 
 
 class TestContinueChatting:

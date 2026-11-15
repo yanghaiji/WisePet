@@ -45,6 +45,8 @@ from ..domain.config_model import (
     BubbleSettings,
     PersonaConfig,
     ReminderSettings,
+    LocationSettings,
+    WebSearchSettings,
     normalize_skin,
 )
 from ..domain.errors import AIGatewayError
@@ -265,13 +267,20 @@ class SettingsDialog(QDialog):
                  on_saved: Callable[[AppConfig], None] | None = None,
                  skin_options: list[str] | None = None,
                  screen_bounds: ScreenBounds | None = None,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None,
+                 is_manager: bool = True,
+                 profile_name: str = "",
+                 on_change_pin: Callable[[], None] | None = None):
         """`skin_options=None` 表示展示全部已定义皮肤；传入则只展示素材齐全的皮肤，
-        但当前已选皮肤永远保留（避免静默把用户的选项改掉）。"""
+        但当前已选皮肤永远保留（避免静默把用户的选项改掉）。
+        is_manager：当前是否管理员（默认身份）——家庭共享 AI 只有管理员可配。"""
         super().__init__(parent)
         self._base = config
         self._on_saved = on_saved
         self._screen = screen_bounds
+        self._is_manager = is_manager
+        self._identity_name = profile_name
+        self._on_change_pin = on_change_pin
         self._skins = list(skin_options) if skin_options else list(PET_SKINS)
         if config.pet.skin not in self._skins:
             self._skins.append(normalize_skin(config.pet.skin))
@@ -376,10 +385,16 @@ class SettingsDialog(QDialog):
                          self._quiet_daily, self._quiet_per_source,
                          self._memory_search_limit,
                          self._log_max_mb, self._log_retention,
-                         self._trickle_every)
+                         self._trickle_every, self._reunion_hours,
+                         self._roam_jump_interval, self._focus_default,
+                         self._bubble_duration, self._dnd_start, self._dnd_end,
+                         self._cheer_interval, self._news_interval,
+                         self._max_recalls, self._task_poll,
+                         self._knowledge_top_k, self._event_limit)
         for widget in value_widgets + (self._skin, self._weekly_weekday,
                                        self._action_permission, self._log_level,
-                                       self._activity, self._overflow_mode):
+                                       self._activity, self._overflow_mode,
+                                       self._enter_effect):
             widget.wheel_target = self._scroll.viewport()
         for widget in value_widgets:
             # 上一轮把滚轮改成「只滚页面」、微调按钮又做成透明，用户以为没法输入。
@@ -464,6 +479,31 @@ class SettingsDialog(QDialog):
         form.addRow("Base URL", self._base_url)
         form.addRow("API Key", self._api_key)
         form.addRow("Model", self._model)
+        self._embedding_model = QLineEdit(box)
+        self._embedding_model.setPlaceholderText("语义检索用的 embedding 模型（留空禁用）")
+        form.addRow("Embedding 模型", self._embedding_model)
+        identity_label = QLabel(
+            f"当前身份：{self._identity_name or '默认身份'} · "
+            f"{'👑 管理员（可共享 AI 给全家）' if self._is_manager else '普通成员'}", box)
+        identity_label.setObjectName("pickerHint")
+        form.addRow(" ", identity_label)
+        self._share_family = QCheckBox("共享给全家人（家人勾「使用家庭共享 AI」即共用我的 Key）",
+                                       box)
+        self._share_family.setToolTip("只有管理员（默认身份）可以共享；"
+                                      "Key 保存在本机全局文件，不会写进家人配置")
+        if not self._is_manager:
+            self._share_family.setEnabled(False)
+            self._share_family.setToolTip(
+                f"当前身份是「{self._identity_name or '默认身份'}」，不是管理员。"
+                "切回默认身份后才能共享 AI 给全家")
+        form.addRow("家庭共享", self._share_family)
+        self._change_pin_btn = QPushButton("🔑 修改我的 PIN…", box)
+        self._change_pin_btn.setObjectName("pickerAction")
+        if self._on_change_pin is not None:
+            self._change_pin_btn.clicked.connect(lambda: self._on_change_pin())
+        else:
+            self._change_pin_btn.setEnabled(False)
+        form.addRow("我的 PIN", self._change_pin_btn)
         form.addRow("Temperature", self._temperature)
         form.addRow("超时", self._timeout)
         return box
@@ -568,12 +608,25 @@ class SettingsDialog(QDialog):
                              ("活泼一点", "lively")):
             self._activity.addItem(label, value)
         self._activity.setToolTip("只影响多久自己出发一次，不改状态机与全部状态轮播")
+        self._enter_effect = _NoWheelComboBox(box)
+        for label, value in (("自动（按场景切换）", "auto"),
+                             ("随机（每次不同）", "random"),
+                             ("粒子汇聚（开机）", "spawn"),
+                             ("粒子爆开（庆祝）", "burst"),
+                             ("碎片拼合（几何）", "puzzle"),
+                             ("HUD 扫描（极客）", "terminal"),
+                             ("能量揭幕（换场）", "curtain"),
+                             ("能量波纹（优雅）", "ink"),
+                             ("聚焦光束（寻回）", "magnifier")):
+            self._enter_effect.addItem(label, value)
+        self._enter_effect.setToolTip("宠物登场时播放的特效；7 种风格共享同一套汇聚环/扫描环/白核爆闪骨架。选「自动」按场景切换，其中「从托盘恢复」每次随机；选「随机」则每次都随机")
         self._stick_to_floor = QCheckBox(
             "松手后自动落回屏幕底部（取消勾选可停在任意位置）", box)
         self._roam = QCheckBox(
             "自由漫游：可停留在桌面任意高度走动/睡觉，偶尔柔和地瞬移换地方", box)
         form.addRow("形象", self._skin)
         form.addRow("活泼度", self._activity)
+        form.addRow("进入特效", self._enter_effect)
         form.addRow("走动速度", self._walk_speed)
         form.addRow("闲置间隔下限", self._idle_min)
         form.addRow("闲置间隔上限", self._idle_max)
@@ -659,6 +712,24 @@ class SettingsDialog(QDialog):
         self._growth_enabled = QCheckBox(
             "成长体系（互动积累等级与形态，右键「陪伴统计」查看）", box)
         form.addRow("成长体系", self._growth_enabled)
+        # 关系感：惦记 / 情境 / 可干预 / 久别重逢（全部基于本机事实，可一键退回旧行为）
+        self._companion_enabled = QCheckBox("关系感（下面四项的 total 开关）", box)
+        self._recall_enabled = QCheckBox("主动提起还没兑现的惦记（每天最多一条）", box)
+        self._recall_prompt = QCheckBox("把惦记悄悄告诉 AI，让它聊得自然（不主动推）", box)
+        self._companion_contextual = QCheckBox("按周一早晨 / 深夜 / 刚结束专注调整动作与话术", box)
+        self._companion_interactive = QCheckBox("摸一下 / 叫一声会打断它当下的动作", box)
+        self._reunion_enabled = QCheckBox("久别重逢时它说得出你离开了多久", box)
+        self._reunion_hours = _int_spin(1, 720, 20, " 小时", box)
+        form.addRow("关系感", self._companion_enabled)
+        form.addRow("主动惦记", self._recall_enabled)
+        form.addRow("惦记入脑", self._recall_prompt)
+        form.addRow("情境化", self._companion_contextual)
+        form.addRow("可干预", self._companion_interactive)
+        form.addRow("久别问候", self._reunion_enabled)
+        form.addRow("久别阈值", self._reunion_hours)
+        self._max_recalls = _int_spin(1, 10, 3, " 条", box)
+        self._max_recalls.setToolTip("同时惦记几件事；说「搞定了」会自动消解最近一件")
+        form.addRow("惦记条数", self._max_recalls)
         return box
 
     def _build_experience_group(self, parent: QWidget) -> QFrame:
@@ -685,8 +756,11 @@ class SettingsDialog(QDialog):
         form.addRow("行为驱动", self._behavior_context)
         self._memory_enabled = QCheckBox("长期记忆（记住名字与近况，只存本机）", box)
         self._memory_search_limit = _int_spin(5, 500, 50, " 条", box)
+        self._summary_enabled = QCheckBox(
+            "会话摘要（被截断的旧对话压缩成一段记忆，聊多久都不失忆）", box)
         form.addRow("长期记忆", self._memory_enabled)
         form.addRow("检索上限", self._memory_search_limit)
+        form.addRow("会话摘要", self._summary_enabled)
         self._action_permission = _NoWheelComboBox(box)
         for label, value in (("每次确认（推荐）", "confirm"),
                              ("始终允许", "auto"), ("一律拒绝", "deny")):
@@ -695,6 +769,61 @@ class SettingsDialog(QDialog):
         self._action_remember = QCheckBox("允许在确认框里记住「以后都允许」", box)
         form.addRow("写盘权限", self._action_permission)
         form.addRow("记住授权", self._action_remember)
+        # 轴②助理能力：托付 / 资料索引 / 事件驱动主动，全部本机、默认资料索引关闭
+        self._assistant_enabled = QCheckBox("助理能力（下面三组的总开关）", box)
+        self._tasks_enabled = QCheckBox("可托付任务（盯文件 / 按间隔催，失败会重试）", box)
+        self._task_poll = _int_spin(10, 600, 30, " s", box)
+        self._use_family_ai = QCheckBox(
+            "使用家庭共享 AI（默认勾选：自动跟随管理员共享的 Key；取消则用下面自己的 Key）",
+            box)
+        self._daily_ai_limit = _int_spin(0, 500, 0, " 次/天", box)
+        self._daily_ai_limit.setToolTip("本身份每天最多几次 AI 请求；0 = 不限。"
+                                        "超过后回落本地小脑，防孩子过度消费")
+        self._knowledge_enabled = QCheckBox("本地资料索引（只在你指定的文件夹里读文本）", box)
+        self._knowledge_dir = QLineEdit(box)
+        self._knowledge_dir.setPlaceholderText("资料文件夹绝对路径，如 D:/notes（留空=不读）")
+        self._knowledge_top_k = _int_spin(1, 8, 3, " 片段", box)
+        self._semantic_search = QCheckBox(
+            "语义检索（按意思找资料；需在 AI 服务里填 Embedding 模型）", box)
+        self._events_enabled = QCheckBox("按本机情境主动关心（回来 / 深夜 / 连着专注）", box)
+        self._event_limit = _int_spin(0, 10, 2, " 条/天", box)
+        # 联网能力：web_search 与 IP 定位（get_location），默认开启可关
+        self._web_search_enabled = QCheckBox("联网搜索（AI 可查实时网页信息）", box)
+        self._web_search_provider = _NoWheelComboBox(box)
+        for label, value in (("必应 Bing（免 Key，国内直连，推荐）", "bing"),
+                             ("DuckDuckGo（免 Key，国内网络通常不通）", "duckduckgo"),
+                             ("Tavily（海外效果，填 Key）", "tavily"),
+                             ("博查（国内效果好，填 Key）", "bocha")):
+            self._web_search_provider.addItem(label, value)
+        self._web_search_key = QLineEdit(box)
+        self._web_search_key.setEchoMode(QLineEdit.Password)
+        self._web_search_key.setPlaceholderText("所选供应商的 API Key（DuckDuckGo 不用填）")
+        self._amap_key = QLineEdit(box)
+        self._amap_key.setEchoMode(QLineEdit.Password)
+        self._amap_key.setPlaceholderText("高德 Web 服务 Key（填了才能查附近的店铺，lbs.amap.com 免费申请）")
+        self._location_enabled = QCheckBox("位置权限（AI 查「附近」时取 IP 所在城市）", box)
+        self._location_consent = _NoWheelComboBox(box)
+        for label, value in (("每次询问（弹窗问我要不要给）", "ask"),
+                             ("总是允许（不再弹窗）", "granted"),
+                             ("不允许（AI 拿不到位置）", "denied")):
+            self._location_consent.addItem(label, value)
+        form.addRow("助理能力", self._assistant_enabled)
+        form.addRow("可托付", self._tasks_enabled)
+        form.addRow("盯文件间隔", self._task_poll)
+        form.addRow("家庭共享 AI", self._use_family_ai)
+        form.addRow("每日 AI 上限", self._daily_ai_limit)
+        form.addRow("资料索引", self._knowledge_enabled)
+        form.addRow("资料文件夹", self._knowledge_dir)
+        form.addRow("注入片段", self._knowledge_top_k)
+        form.addRow("语义检索", self._semantic_search)
+        form.addRow("事件主动", self._events_enabled)
+        form.addRow("情境上限", self._event_limit)
+        form.addRow("联网搜索", self._web_search_enabled)
+        form.addRow("搜索源", self._web_search_provider)
+        form.addRow("搜索 Key", self._web_search_key)
+        form.addRow("高德 Key", self._amap_key)
+        form.addRow("位置权限", self._location_enabled)
+        form.addRow("授权策略", self._location_consent)
         return box
 
     def _build_system_group(self, parent: QWidget) -> QFrame:
@@ -737,6 +866,10 @@ class SettingsDialog(QDialog):
         self._load_profile_fields(self._profile_combo.currentText())
         self._temperature.setValue(cfg.ai.temperature)
         self._timeout.setValue(int(cfg.ai.timeout_s))
+        self._embedding_model.setText(cfg.ai.embedding_model)
+        self._share_family.setChecked(
+            getattr(getattr(cfg, "assistant", None), "share_family_ai", False)
+            if self._is_manager else False)
         self._persona_name.setText(cfg.persona.name)
         self._system_prompt.setPlainText(cfg.persona.system_prompt)
         self._walk_speed.setValue(cfg.pet.walk_speed_px_per_s)
@@ -752,6 +885,10 @@ class SettingsDialog(QDialog):
             getattr(cfg.pet, "activity", "normal"))
         if activity_index >= 0:
             self._activity.setCurrentIndex(activity_index)
+        enter_index = self._enter_effect.findData(
+            getattr(cfg.pet, "enter_effect", "auto"))
+        if enter_index >= 0:
+            self._enter_effect.setCurrentIndex(enter_index)
         index = self._skin.findData(normalize_skin(cfg.pet.skin))
         if index >= 0:
             self._skin.setCurrentIndex(index)
@@ -789,6 +926,65 @@ class SettingsDialog(QDialog):
         self._weekly_hour.setValue(int(weekly.hour) if weekly is not None else 20)
         growth = getattr(cfg, "growth", None)
         self._growth_enabled.setChecked(growth.enabled if growth is not None else True)
+        companion = getattr(cfg, "companion", None)
+        self._companion_enabled.setChecked(
+            companion.enabled if companion is not None else True)
+        self._recall_enabled.setChecked(
+            companion.recall_enabled if companion is not None else True)
+        self._recall_prompt.setChecked(
+            companion.memory_prompt_enabled if companion is not None else True)
+        self._companion_contextual.setChecked(
+            companion.contextual if companion is not None else True)
+        self._companion_interactive.setChecked(
+            companion.interactive if companion is not None else True)
+        self._reunion_enabled.setChecked(
+            companion.reunion_enabled if companion is not None else True)
+        self._reunion_hours.setValue(
+            int(companion.reunion_min_hours) if companion is not None else 20)
+        self._max_recalls.setValue(
+            int(getattr(companion, "max_recalls", 3)) if companion is not None else 3)
+        assistant = getattr(cfg, "assistant", None)
+        self._assistant_enabled.setChecked(
+            assistant.enabled if assistant is not None else True)
+        self._tasks_enabled.setChecked(
+            assistant.tasks_enabled if assistant is not None else True)
+        self._task_poll.setValue(
+            int(assistant.task_poll_s) if assistant is not None else 30)
+        self._use_family_ai.setChecked(
+            assistant.use_family_ai if assistant is not None else False)
+        self._daily_ai_limit.setValue(
+            int(assistant.daily_ai_limit) if assistant is not None else 0)
+        self._knowledge_enabled.setChecked(
+            assistant.knowledge_enabled if assistant is not None else False)
+        self._knowledge_dir.setText(
+            assistant.knowledge_dir if assistant is not None else "")
+        self._knowledge_top_k.setValue(
+            int(assistant.knowledge_top_k) if assistant is not None else 3)
+        self._semantic_search.setChecked(
+            assistant.semantic_search if assistant is not None else False)
+        self._events_enabled.setChecked(
+            assistant.events_enabled if assistant is not None else True)
+        self._event_limit.setValue(
+            int(assistant.event_daily_limit) if assistant is not None else 2)
+        web = getattr(cfg, "web_search", None)
+        self._web_search_enabled.setChecked(
+            web.enabled if web is not None else True)
+        prov_index = self._web_search_provider.findData(
+            getattr(web, "provider", "bing") if web is not None
+            else "bing")
+        if prov_index >= 0:
+            self._web_search_provider.setCurrentIndex(prov_index)
+        self._web_search_key.setText(
+            getattr(web, "api_key", "") if web is not None else "")
+        self._amap_key.setText(
+            getattr(web, "amap_key", "") if web is not None else "")
+        location = getattr(cfg, "location", None)
+        self._location_enabled.setChecked(
+            location.enabled if location is not None else True)
+        consent_index = self._location_consent.findData(
+            getattr(location, "consent", "ask") if location is not None else "ask")
+        if consent_index >= 0:
+            self._location_consent.setCurrentIndex(consent_index)
         quiet = getattr(cfg, "quiet", None)
         self._quiet_enabled.setChecked(quiet.enabled if quiet is not None else True)
         self._quiet_daily.setValue(int(quiet.daily_limit) if quiet is not None else 12)
@@ -808,6 +1004,8 @@ class SettingsDialog(QDialog):
         self._memory_enabled.setChecked(memory.enabled if memory is not None else True)
         self._memory_search_limit.setValue(
             int(memory.search_max_results) if memory is not None else 50)
+        self._summary_enabled.setChecked(
+            getattr(memory, "summary_enabled", True) if memory is not None else True)
         actions = getattr(cfg, "actions", None)
         pidx = self._action_permission.findData(
             actions.write_permission if actions is not None else "confirm")
@@ -849,8 +1047,12 @@ class SettingsDialog(QDialog):
                      base_url=active.base_url,
                      api_key=active.api_key,
                      model=active.model,
+                     embedding_model=self._embedding_model.text().strip(),
                      temperature=float(self._temperature.value()),
                      timeout_s=float(self._timeout.value()))
+        # 管理员专属：共享状态持久化在 assistant 分节（文件落盘由组装根处理）
+        assistant_share = (self._share_family.isChecked() if self._is_manager
+                           else self._base.assistant.share_family_ai)
         persona = PersonaConfig(name=self._persona_name.text().strip()
                                 or self._base.persona.name,
                                 system_prompt=self._system_prompt.toPlainText().strip()
@@ -860,6 +1062,7 @@ class SettingsDialog(QDialog):
         pet = replace(self._base.pet,
                       skin=self._skin.currentData() or DEFAULT_SKIN,
                       activity=self._activity.currentData() or "normal",
+                      enter_effect=self._enter_effect.currentData() or "auto",
                       walk_speed_px_per_s=float(self._walk_speed.value()),
                       idle_min_s=float(self._idle_min.value()),
                       idle_max_s=float(self._idle_max.value()),
@@ -914,7 +1117,8 @@ class SettingsDialog(QDialog):
                            context_driven=self._behavior_context.isChecked())
         memory = replace(self._base.memory,
                          enabled=self._memory_enabled.isChecked(),
-                         search_max_results=int(self._memory_search_limit.value()))
+                         search_max_results=int(self._memory_search_limit.value()),
+                         summary_enabled=self._summary_enabled.isChecked())
         actions = replace(self._base.actions,
                           write_permission=self._action_permission.currentData()
                           or "confirm",
@@ -924,13 +1128,46 @@ class SettingsDialog(QDialog):
                          log_max_mb=int(self._log_max_mb.value()),
                          log_retention_days=int(self._log_retention.value()),
                          log_split_by_level=self._log_split.isChecked())
+        companion = replace(self._base.companion,
+                            enabled=self._companion_enabled.isChecked(),
+                            recall_enabled=self._recall_enabled.isChecked(),
+                            memory_prompt_enabled=self._recall_prompt.isChecked(),
+                            contextual=self._companion_contextual.isChecked(),
+                            interactive=self._companion_interactive.isChecked(),
+                            reunion_enabled=self._reunion_enabled.isChecked(),
+                            reunion_min_hours=float(self._reunion_hours.value()),
+                            max_recalls=int(self._max_recalls.value()))
+        assistant = replace(self._base.assistant,
+                            enabled=self._assistant_enabled.isChecked(),
+                            tasks_enabled=self._tasks_enabled.isChecked(),
+                            task_poll_s=float(self._task_poll.value()),
+                            use_family_ai=self._use_family_ai.isChecked(),
+                            share_family_ai=assistant_share,
+                            daily_ai_limit=int(self._daily_ai_limit.value()),
+                            knowledge_enabled=self._knowledge_enabled.isChecked(),
+                            knowledge_dir=self._knowledge_dir.text().strip(),
+                            knowledge_top_k=int(self._knowledge_top_k.value()),
+                            semantic_search=self._semantic_search.isChecked(),
+                            events_enabled=self._events_enabled.isChecked(),
+                            event_daily_limit=int(self._event_limit.value()))
+        web_search = WebSearchSettings(
+            enabled=self._web_search_enabled.isChecked(),
+            provider=self._web_search_provider.currentData() or "bing",
+            api_key=self._web_search_key.text().strip(),
+            amap_key=self._amap_key.text().strip(),
+            max_results=int(getattr(self._base.web_search, "max_results", 5)))
+        location = LocationSettings(
+            enabled=self._location_enabled.isChecked(),
+            consent=self._location_consent.currentData() or "ask")
         return AppConfig(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                          vitals=self._base.vitals, reminders=reminders,
                          news=news, cheer=cheer, bubble=bubble, chat=chat,
                          focus=focus, dnd=dnd, tts=tts, notification=notification,
                          weekly=weekly, growth=growth, quiet=quiet,
                          behavior=behavior, memory=memory, actions=actions,
-                         system=system), ""
+                         system=system, companion=companion,
+                         assistant=assistant, web_search=web_search,
+                         location=location), ""
 
     def _match_active_profile(self, cfg: AppConfig) -> str:
         """当前生效 ai 对应的方案名；找不到就用第一个方案。"""

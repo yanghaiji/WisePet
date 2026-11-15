@@ -34,9 +34,11 @@ ROOT = _runtime_root()
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QProcess, QTimer
+from shiboken6 import isValid
 from PySide6.QtGui import QCursor, QGuiApplication                    # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox               # noqa: E402
+from PySide6.QtWidgets import (                                        # noqa: E402
+    QApplication, QDialog, QInputDialog, QMessageBox)
 
 from WisePet.app.action_audit import ActionAudit                       # noqa: E402
 from WisePet.app.action_protocol import (                               # noqa: E402
@@ -55,12 +57,21 @@ from WisePet.app.action_protocol import (                               # noqa: 
     parse_focus_command,
     parse_reminder_command,
 )
+from WisePet.app.agent_loop import AgentRunner                          # noqa: E402
+from WisePet.app.auto_facts import AutoFactExtractor                     # noqa: E402
+from WisePet.app.agent_tools import AgentToolbox                        # noqa: E402
+from WisePet.app.summary_memory import SummaryMemory, SummaryStore       # noqa: E402
 from WisePet.app.cheer_service import CheerService                      # noqa: E402
+from WisePet.app.companion_service import CompanionService              # noqa: E402
 from WisePet.app.chat_history import ChatHistory                        # noqa: E402
 from WisePet.app.chat_service import ChatService                       # noqa: E402
 from WisePet.app.data_steward import DataSteward                        # noqa: E402
 from WisePet.app.event_bus import EventBus                              # noqa: E402
+from WisePet.app.event_triggers import EventTriggerService             # noqa: E402
 from WisePet.app.focus_service import FocusLog, FocusService           # noqa: E402
+from WisePet.app.knowledge_base import KnowledgeBase                    # noqa: E402
+from WisePet.app.memory_timeline import MemoryTimeline                  # noqa: E402
+from WisePet.app.task_service import TaskService                        # noqa: E402
 from WisePet.app.growth_service import GrowthService                    # noqa: E402
 from WisePet.app.local_responder import LocalContext, LocalResponder    # noqa: E402
 from WisePet.app.long_term_memory import LongTermMemory                  # noqa: E402
@@ -89,6 +100,8 @@ from WisePet.domain.events import (                                    # noqa: E
     HotkeyChatRequestedEvent,
     SpeakRequestedEvent,
 )
+from WisePet.domain.companion import context_phrase                    # noqa: E402
+from WisePet.domain.task_protocol import is_done_signal, parse_task_command  # noqa: E402
 from WisePet.domain.config_model import AppConfig                       # noqa: E402
 from WisePet.domain.pet import Pet                                     # noqa: E402
 from WisePet.domain.product import (                                   # noqa: E402
@@ -100,8 +113,9 @@ from WisePet.domain.state_machine import BehaviorState                  # noqa: 
 from WisePet.domain.errors import AIGatewayError                        # noqa: E402
 from WisePet.domain.vitals import VitalsVO                              # noqa: E402
 from WisePet.infra.sqlite_chat_repo import SqliteChatRepository         # noqa: E402
+from WisePet.infra.ai_stores import AIUsageStore, SharedAIStore        # noqa: E402
 from WisePet.infra.config_repo import (                               # noqa: E402
-    JsonConfigRepository, migrate_legacy_data)
+    JsonConfigRepository, default_data_dir, migrate_legacy_data)
 from WisePet.infra.frame_loader import FrameAssetLoader                # noqa: E402
 from WisePet.infra.global_hotkey import GlobalHotKey                   # noqa: E402
 from WisePet.infra.growth_store import GrowthStore                     # noqa: E402
@@ -119,14 +133,27 @@ from WisePet.infra.product_store import (                              # noqa: E
     ActionAuditStore, MemoryStore, QuietStore)
 from WisePet.infra.telemetry_store import TelemetryStore               # noqa: E402
 from WisePet.infra.pet_state_repo import PetStateRepository            # noqa: E402
+from WisePet.infra.event_store import EventStore                        # noqa: E402
+from WisePet.infra.knowledge_store import KnowledgeStore                # noqa: E402
+from WisePet.infra.presence_store import PresenceStore                  # noqa: E402
+from WisePet.infra.profile_store import (                              # noqa: E402
+    ProfileStore, guard_port_for)
+from WisePet.infra.profile_store import safe_name as safe_profile_name  # noqa: E402
+from WisePet.infra.task_store import TaskStore                          # noqa: E402
 from WisePet.infra.system_clock import SystemClock                     # noqa: E402
+from WisePet.infra.web_search import WebSearchGateway                   # noqa: E402
+from WisePet.infra.geo_location import GeoLocator                       # noqa: E402
+from WisePet.infra.amap_api import AmapPoiGateway                       # noqa: E402
 from WisePet.ui.action_confirm import ActionConfirmDialog               # noqa: E402
 from WisePet.ui.command_palette import CommandPalette                   # noqa: E402
 from WisePet.ui.ai_worker import AiWorker                              # noqa: E402
 from WisePet.ui.onboarding_dialog import OnboardingDialog               # noqa: E402
+from WisePet.ui.profile_picker import ProfilePickerDialog               # noqa: E402
 from WisePet.ui.chat_input import ChatInput                             # noqa: E402
 from WisePet.ui.chat_text_edit import attachment_from_clipboard_image   # noqa: E402
 from WisePet.ui.chat_window import ChatWindow                           # noqa: E402
+from WisePet.ui.consent_bridge import LocationConsentBridge             # noqa: E402
+from WisePet.ui.position_bridge import PositionBridge                   # noqa: E402
 from WisePet.ui.frame_animator import CANVAS_SIZE, FrameAnimator       # noqa: E402
 from WisePet.ui.pet_window import PetWindow                            # noqa: E402
 from WisePet.ui.qt_bridge import EventRouter, QtEventBridge            # noqa: E402
@@ -134,8 +161,10 @@ from WisePet.ui.region_selector import RegionSelector                   # noqa: 
 from WisePet.ui.screen_bounds import ScreenBounds                     # noqa: E402
 from WisePet.ui.settings_dialog import SettingsDialog                  # noqa: E402
 from WisePet.ui.speech_bubble import SpeechBubble                      # noqa: E402
+from WisePet.ui.memory_dialog import MemoryDialog                       # noqa: E402
 from WisePet.ui.stats_dialog import StatsDialog                        # noqa: E402
-from WisePet.ui.tech_effects import TechEffect                         # noqa: E402
+from WisePet.ui.tech_effects import (ENTER_KINDS, TechEffect,         # noqa: E402
+                                      TRIGGER_ENTER_KIND, random_enter_kind)
 from WisePet.ui.tray_icon import HIDE_DISABLED_HINT, PetTrayIcon          # noqa: E402
 from WisePet.ui.tray_menu import PetMenu                               # noqa: E402
 
@@ -169,6 +198,14 @@ COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("audit", "最近执行的操作", "写盘 / 工具历史"),
     ("settings", "打开设置", "系统配置等分区"),
     ("stats", "陪伴统计", "天数 / 消息数 / 等级"),
+    ("call", "叫一声小墨", "打断它当下在做的事，让它抬头看你"),
+    ("recall", "我还记得什么", "看看它惦记着哪几句旧话"),
+    ("tasks", "我的托付", "列出正在替你盯着的事"),
+    ("cancel_tasks", "取消全部托付", "不再盯、不再催"),
+    ("knowledge_build", "重建资料索引", "重读你指定的本机文件夹"),
+    ("knowledge_status", "资料索引状态", "读了哪些文件、多少片段"),
+    ("profile_switch", "切换身份", "本机多用户（家人共机），重启生效"),
+    ("family_share", "共享我的 AI 给全家", "家长配一次 Key，家人勾选即可共用"),
 )
 #: 启动问候兜底语（未连模型或生成失败时；{name} 填宠物名）
 STARTUP_GREETING_FALLBACK = "{name}来召唤你啦，让我们开启美好的一天吧！"
@@ -191,8 +228,12 @@ class PetApplication:
                  clock: SystemClock | None = None,
                  chat_log_repo: SqliteChatRepository | None = None,
                  tray_available: bool | None = None,
-                 onboarding: bool = False):
+                 onboarding: bool = False,
+                 profile: str = "",
+                 shared_ai: SharedAIStore | None = None):
         self._app = app
+        # 当前身份（v1.31 本地多用户）：空串 = 默认身份（管理员）
+        self._profile = str(profile or "")
         # 默认 False：offscreen 组装测试不弹引导；只有真实入口 main() 判定首次运行才打开
         self._onboarding_enabled = onboarding
         # 宠物藏起来后进程没有任何可见窗口；不关掉这个开关，事件循环会跟着退出
@@ -211,12 +252,16 @@ class PetApplication:
         self._data_dir = self._config_repo.path.parent
         self._quiet_budget = QuietBudget(QuietStore(self._data_dir), self._clock,
                                          lambda: self._config)
-        self._memory = LongTermMemory(MemoryStore(self._data_dir),
-                                      lambda: self._config.memory.enabled)
+        self._memory_store = MemoryStore(self._data_dir)
+        self._memory = LongTermMemory(
+            self._memory_store, lambda: self._config.memory.enabled,
+            clock=self._clock,
+            ttl_provider=lambda: self._config.memory.fact_ttl_days)
         # P0：本地埋点（只记事件名与按天计数，绝不上传）+ 崩溃本地留痕
         self._telemetry = TelemetryService(TelemetryStore(self._data_dir), self._clock)
         self._telemetry.install_crash_hook()
-        self._audit = ActionAudit(ActionAuditStore(self._data_dir))
+        self._audit_store = ActionAuditStore(self._data_dir)
+        self._audit = ActionAudit(self._audit_store)
         self._data_steward = DataSteward(self._chat_log_repo, self._data_dir,
                                          telemetry=self._telemetry)
         self._active_scene = "自定义"
@@ -243,11 +288,20 @@ class PetApplication:
         self._local = LocalResponder(context_provider=self._local_context,
                                      on_remind=self._schedule_remind_action)
         self._ai_client = OpenAICompatClient()
+        # 家庭共享 AI（全局）：默认真实用户目录；测试注入 tmp 隔离，
+        # 否则开发机上真实 shared_ai.json 会泄漏进测试（真机踩过）
+        self._shared_ai = shared_ai or SharedAIStore(default_data_dir())
+        self._ai_usage = AIUsageStore(self._data_dir)         # 本身份每日用量
         self._chat = ChatService(
             gateway=self._ai_client, session=self._session, bus=self._bus,
-            config_provider=lambda: self._config.ai,
+            config_provider=lambda: self._effective_ai(),
             system_prompt_provider=self._system_prompt,
-            local_responder=self._local)
+            local_responder=self._local,
+            tool_runner=self._run_agent,
+            summary_observer=self._observe_summary,
+            summary_prefix_provider=lambda: self._summary.prefix_line(),
+            ai_allowed_provider=lambda: self._ai_within_quota(),
+            on_ai_request=self._count_ai_request)
         self._reminder = ReminderService(
             clock=self._clock, bus=self._bus,
             config_provider=lambda: self._config,
@@ -281,6 +335,76 @@ class PetApplication:
             summarizer=self._summarize_week, deferral_provider=self._quiet_deferral)
         self._tts = TtsAnnouncer(create_synthesizer(enabled=True),
                                  lambda: self._config)
+        # 陪伴轴：精确「上次出现」时间戳 + 惦记 / 久别 / 情境（独立于按天刷新的 growth/telemetry）
+        self._presence = PresenceStore(self._data_dir)
+        self._companion = CompanionService(
+            clock=self._clock, bus=self._bus,
+            config_provider=lambda: self._config,
+            records_provider=lambda: self._chat_history.recent_turns(21),
+            store=self._presence,
+            name_provider=lambda: self._pet.name)
+        # 轴②助理能力：可托付任务 / 本地资料索引 / 事件驱动主动（全本机）
+        self._task_store = TaskStore(self._data_dir)
+        self._tasks = TaskService(
+            clock=self._clock, bus=self._bus,
+            config_provider=lambda: self._config, store=self._task_store,
+            audit=self._audit,
+            enabled_provider=lambda: (self._config.assistant.enabled
+                                      and self._config.assistant.tasks_enabled))
+        self._knowledge_store = KnowledgeStore(self._data_dir)
+        self._knowledge = KnowledgeBase(
+            self._knowledge_store,
+            embedding_fn=self._embed_texts)
+        self._summary_store = SummaryStore(self._data_dir)
+        self._summary = SummaryMemory(
+            self._summary_store, self._ai_client, lambda: self._effective_ai(),
+            enabled_provider=lambda: (self._config.memory.enabled
+                                      and self._config.memory.summary_enabled
+                                      and self._effective_ai().configured))
+        # 通用事实记忆：AI 自己判断什么值得记（名字/喜好/约定/项目…），不靠正则
+        self._auto_facts = AutoFactExtractor(
+            self._memory, self._ai_client, lambda: self._effective_ai(),
+            enabled_provider=lambda: (self._config.memory.enabled
+                                      and self._effective_ai().configured))
+        self._event_store = EventStore(self._data_dir)
+        self._events = EventTriggerService(
+            clock=self._clock, bus=self._bus,
+            config_provider=lambda: self._config, store=self._event_store,
+            idle_provider=idle_seconds,
+            focus_count_provider=lambda: FocusLog.summarize(
+                self._load_focus_entries(), day_key(self._clock.now()))[1])
+        self._timeline = MemoryTimeline(
+            memory_store=self._memory_store, memory_service=self._memory,
+            audit_store=self._audit_store, chat_repo=self._chat_log_repo,
+            telemetry=self._telemetry, presence_store=self._presence,
+            task_service=self._tasks, knowledge=self._knowledge,
+            event_store=self._event_store)
+        self._quota_warned_day = ""
+        # 轴②：agent 工具循环（function calling 多步）——写盘动作交回主线程确认
+        # 联网能力：web_search（免 Key DuckDuckGo / 可选 Tavily・博查）与
+        # IP 城市级定位；位置授权弹窗桥在 worker 线程阻塞等主线程弹窗结果
+        self._web_search = WebSearchGateway(
+            provider_provider=lambda: self._config.web_search,
+            key_provider=lambda: self._config.web_search.api_key)
+        self._position_bridge = PositionBridge()   # 系统级精确定位（主线程异步）
+        self._geo = GeoLocator(
+            precise_provider=(self._position_bridge.request
+                              if self._position_bridge.available else None))
+        self._amap = AmapPoiGateway(
+            key_provider=lambda: self._config.web_search.amap_key)
+        self._consent_bridge = LocationConsentBridge(
+            self._ask_location_consent, parent=None)
+        self._toolbox = AgentToolbox(
+            knowledge=self._knowledge, chat_history=self._chat_history,
+            memory_service=self._memory, tasks=self._tasks, pet=self._pet,
+            config_provider=lambda: self._config,
+            remind_callback=self._schedule_remind_action,
+            web_search=self._web_search, geo=self._geo, amap=self._amap,
+            location_consent=self._consent_bridge.ask)
+        self._agent = AgentRunner(
+            self._ai_client, lambda: self._effective_ai(),
+            lambda: self._system_prompt(), self._toolbox)
+        self._pending_query = ""
 
         self._animator = FrameAnimator(FrameAssetLoader(self._assets_dir,
                                                         self._config.pet.skin),
@@ -289,7 +413,8 @@ class PetApplication:
                                  lambda: self._config, self._screen, size=PET_SIZE,
                                  growth_provider=self._growth_decoration)
         self._bubble = SpeechBubble(
-            self._screen, duration_provider=lambda: self._config.bubble.duration_s)
+            self._screen, duration_provider=lambda: self._config.bubble.duration_s,
+            avoid_provider=lambda: self._window.window_rect())
         self._chat_input = ChatInput(self._screen,                # 点宠物：正常聊天（单行输入条）
                                      idle_hide_provider=lambda: self._config.chat.idle_hide_s)
         self._chat_window = ChatWindow(                # 右键：可继续聊的历史窗
@@ -312,8 +437,12 @@ class PetApplication:
                              on_toggle_mute=self._toggle_mute,
                              on_undo=self._undo_last_action,
                              on_onboarding=self._show_onboarding,
-                             on_palette=self._show_palette)
+                             on_palette=self._show_palette,
+                             on_profile=self._switch_profile)
         self._stats_dialog = StatsDialog(self._screen)
+        self._memory_dialog = MemoryDialog(
+            self._timeline, export_path=self._data_dir / "memory-timeline.md",
+            screen_bounds=self._screen)
         self._onboarding_dialog = OnboardingDialog()
         self._onboarding_dialog.try_chat.connect(self._show_chat_input)
         self._onboarding_dialog.try_reminder.connect(self._demo_reminder)
@@ -347,11 +476,29 @@ class PetApplication:
         """给控制器注入「此刻的生活情境」；关掉因果驱动时返回 None 走原轮播。"""
         if not self._config.behavior.context_driven:
             return None
+        local = time.localtime(self._clock.now())
+        contextual = (self._config.companion.enabled
+                      and self._config.companion.contextual)
         return BehaviorContext(
-            hour=time.localtime(self._clock.now()).tm_hour,
+            hour=local.tm_hour,
             focusing=bool(getattr(self._focus, "running", False)),
             quiet=self._config.quiet.muted or self._quiet_deferral() > 0,
-            idle_s=float(idle_seconds() or 0.0))
+            idle_s=float(idle_seconds() or 0.0),
+            # 关掉「关系感情境」时传 -1，行为与旧版逐字节一致
+            weekday=local.tm_wday if contextual else -1,
+            just_finished_focus=bool(contextual and self._focus.just_finished()))
+
+    def _companion_phrase(self) -> str:
+        """话术侧的情境短语（周一早晨 / 深夜 / 刚结束一场专注）。"""
+        cfg = self._config.companion
+        if not cfg.enabled or not cfg.contextual:
+            return ""
+        local = time.localtime(self._clock.now())
+        return context_phrase(
+            hour=local.tm_hour, weekday=local.tm_wday,
+            focusing=bool(getattr(self._focus, "running", False)),
+            quiet=self._config.quiet.muted or self._quiet_deferral() > 0,
+            just_finished_focus=self._focus.just_finished())
 
     def _growth_decoration(self):
         """等级 → 可见外观；关掉成长体系时不叠加任何装饰。"""
@@ -439,10 +586,60 @@ class PetApplication:
     def _show_palette(self) -> None:
         self._command_palette.show_centered()
 
+    def _run_agent(self, text: str, messages: list[dict],
+                   on_content=None):
+        """ChatService 的 agent 入口：开关关闭时返回 None 走原纯文本流式。
+
+        on_content 为真流式增量回调（模型边生成边投递）；None 走一次性返回。
+        """
+        cfg = self._config.assistant
+        if not cfg.enabled or not cfg.tool_calling_enabled:
+            return None
+        return self._agent.run(text, messages, content_callback=on_content)
+
+    def _effective_ai(self) -> AIConfig:
+        """生效 AI 配置：勾「使用家庭共享 AI」时用家长共享的那份。
+
+        共享 Key 只存在全局 shared_ai.json，孩子身份自己的配置里永远不会
+        写入共享 Key——家长改一次 Key 全家生效。
+        """
+        cfg = self._config
+        if cfg.assistant.use_family_ai:
+            shared = self._shared_ai.load()
+            if shared is not None:
+                return replace(cfg.ai, base_url=shared.base_url,
+                               api_key=shared.api_key, model=shared.model,
+                               embedding_model=shared.embedding_model)
+            logger.warning("family shared AI requested but not configured")
+        return cfg.ai
+
+    def _ai_within_quota(self) -> bool:
+        """每日 AI 请求配额（防孩子过度消费）；超限回落本地小脑并提示一次。"""
+        limit = int(self._config.assistant.daily_ai_limit)
+        if limit <= 0:
+            return True
+        today = day_key(self._clock.now())
+        if self._ai_usage.today(today) < limit:
+            return True
+        if self._quota_warned_day != today:
+            self._quota_warned_day = today
+            self._controller.speak(
+                f"今天的 AI 次数用完啦（{limit} 次/天），我先陪你本地聊～明天恢复。",
+                source="pet")
+        return False
+
+    def _count_ai_request(self) -> None:
+        self._ai_usage.increment(day_key(self._clock.now()))
+
     def _run_command(self, command_id: str) -> None:
         self._telemetry.track(f"cmd:{command_id}")
         if command_id == "chat":
-            self._show_chat_input()
+            # 隐藏则登场（终端召唤+淡入）再开输入条；已可见则直接播终端特效层+开输入
+            if not self._window.isVisible():
+                self._enter_pet("chat", after=self._show_chat_input)
+            else:
+                self._play_effect_only("chat")
+                self._show_chat_input()
         elif command_id == "history":
             self._show_history()
         elif command_id == "search":
@@ -450,10 +647,13 @@ class PetApplication:
             self._chat_window.search_input.setFocus()
         elif command_id == "reminder":
             self._demo_reminder()
+            self._play_or_enter("celebrate")
         elif command_id == "focus":
             self._start_focus(self._config.focus.default_min)
+            self._play_or_enter("celebrate")
         elif command_id in ("scene_healthy", "scene_deep"):
             self._apply_scene("healthy" if command_id == "scene_healthy" else "deep_work")
+            self._play_or_enter("scene")
         elif command_id == "why_quiet":
             self._report(self._companion_status_text())
         elif command_id == "export":
@@ -473,10 +673,9 @@ class PetApplication:
             self._telemetry.clear()
             self._report("本地埋点已清空（聊天记录与其它数据未动）。")
         elif command_id == "memory":
-            timeline = self._memory.timeline()
-            self._report("我记得：" + "；".join(
-                f"{item['day']} {item['key']}={item['value']}" for item in timeline)
-                if timeline else "还没记下什么；聊天时告诉我名字或近况就行。")
+            # 一页看全本机数据并可勾选删除，而不是只报一句文本
+            self._memory_dialog.reload()
+            self._memory_dialog.show_centered()
         elif command_id == "audit":
             recent = self._audit.recent()
             self._report("最近操作：" + "；".join(
@@ -486,6 +685,78 @@ class PetApplication:
             self.open_settings()
         elif command_id == "stats":
             self._show_stats()
+        elif command_id == "call":
+            self._call_pet()
+        elif command_id == "recall":
+            candidates = self._companion.recall_candidates()
+            phrase = self._companion_phrase()
+            prefix = f"现在是{phrase}，" if phrase else ""
+            self._report(prefix + (
+                "我还惦记着：" + "；".join(
+                    f"{c.days_ago} 天前「{c.snippet}」" for c in candidates)
+                if candidates else "还没有记下值得惦记的事～聊聊天就有了。"))
+        elif command_id == "tasks":
+            self._report("我的托付：\n" + self._tasks.describe())
+        elif command_id == "cancel_tasks":
+            count = self._tasks.cancel_all()
+            self._report(f"好，取消了 {count} 个托付，我不再盯着了。" if count
+                         else "现在没有正在进行的托付。")
+        elif command_id == "knowledge_build":
+            self._rebuild_knowledge()
+        elif command_id == "knowledge_status":
+            status = self._knowledge.status()
+            self._report(f"资料索引：{status['files']} 个文件 / "
+                         f"{status['chunks']} 个片段｜目录 {status['folder'] or '未设置'}"
+                         f"｜开关 {'开' if self._config.assistant.knowledge_enabled else '关'}"
+                         f"｜语义 {'开' if status.get('semantic') else '关'}"
+                         f"（{status.get('vectors', 0)} 个向量）")
+        elif command_id == "profile_switch":
+            self._switch_profile()
+        elif command_id == "family_share":
+            if not self._is_manager():
+                self._report("共享 AI 只有管理员（默认身份）能操作；"
+                             "家人在设置里勾「使用家庭共享 AI」即可共用。")
+                return
+            if not self._config.ai.configured:
+                self._report("先在设置里配好 AI（Key + 模型），再共享给全家。")
+                return
+            self._shared_ai.save(self._effective_ai())
+            self._report("已把当前 AI 配置共享给全家——家人的设置里勾选"
+                         "「使用家庭共享 AI」即可共用；Key 存在本机。")
+
+    def _switch_profile(self) -> None:
+        """本机多用户：弹出「谁来了？」选择（带 PIN 验证），选中即无缝换宠。
+
+        与启动时的入口共用同一个对话框——验证逻辑只写一处。切换实现：
+        保存当前状态 → 拉起新进程（新身份，独立守卫端口）→ 当前退场退出，
+        用户看到的是宠物退场→新宠物进场，不需要手动重启。
+        """
+        profiles = ProfileStore(default_data_dir())
+        picker = ProfilePickerDialog(profiles,
+                                     current=profiles.active(),
+                                     parent=self._window)
+        if picker.exec() != QDialog.DialogCode.Accepted or picker.selected is None:
+            return
+        if picker.selected == profiles.active():
+            self._report("现在就是这个身份啦～")
+            return
+        profiles.set_active(picker.selected) if picker.selected \
+            else profiles.clear_active()
+        self._relaunch_as(picker.selected)
+
+    def _relaunch_as(self, profile: str) -> None:
+        """保存状态 → startDetached 拉起新身份进程 → 当前退场退出。"""
+        self.save_state()
+        self._controller.speak("好，马上换人来陪它玩，我先把状态收好～",
+                               source="pet")
+        program = sys.executable
+        args = [] if getattr(sys, "frozen", False) \
+            else [str(Path(sys.argv[0]).resolve())]
+        if profile:
+            args.append(f"--profile={profile}")
+        QProcess.startDetached(program, args, str(ROOT))
+        logger.info("relaunching as profile=%s", profile or "默认")
+        QTimer.singleShot(1200, self._exit_app)   # 让话先说一句再退场
 
     # ---------- 生命周期 ----------
 
@@ -504,15 +775,14 @@ class PetApplication:
         self._news.start()
         self._cheer.start()
         self._weekly.start()
+        # 必须早于问候：先读旧「上次出现」时间戳算间隔，再写入本次启动时间
+        self._companion.boot()
         self._hotkey = GlobalHotKey(
             callback=lambda: self._bus.publish(HotkeyChatRequestedEvent()))
         self._hotkey.start()
         self._sync_model_combo()
         self._sync_window()
-        self._window.setWindowOpacity(0.0)
-        self._window.show()
-        self._window.raise_()
-        self._play_tech_effect("spawn", on_done=self._fade_in_pet)
+        self._enter_pet("boot")
 
         self._tick_timer = QTimer(self._app)
         self._tick_timer.setInterval(TICK_INTERVAL_MS)
@@ -534,6 +804,7 @@ class PetApplication:
 
     def shutdown(self) -> None:
         """退出前取消在途请求并落盘状态（PRD US-4 离线恢复）。"""
+        self._auto_facts.flush()       # 最后几句对话里的事实也尽力抽一次
         self._tray.hide()
         if self._tick_timer is not None:
             self._tick_timer.stop()
@@ -561,6 +832,9 @@ class PetApplication:
         self._focus.tick(now)
         self._weekly.tick(now)
         self._growth.tick(now)
+        self._companion.tick(now)
+        self._tasks.tick(now)
+        self._events.tick(now)
         self._sync_window()
         self._sync_motion_timer()
         if self._clock.monotonic() - self._last_save_at >= self._config.vitals.save_interval_s:
@@ -587,6 +861,9 @@ class PetApplication:
             self._state_repo.save(self._pet)
         except OSError:
             logger.exception("pet state save failed")
+        # 精确「最后出现」时间：独立于会被启动覆盖的 pet_state.last_updated，
+        # 周期落盘 + shutdown 兜底，崩溃时最多丢一个保存周期。
+        self._presence.touch_seen(self._clock.now())
         self._last_save_at = self._clock.monotonic()
 
     # ---------- 装配细节 ----------
@@ -633,11 +910,64 @@ class PetApplication:
         local = time.localtime(self._clock.now())
         weekday = "一二三四五六日"[local.tm_wday]
         now_line = f"\n当前时间：{time.strftime('%Y-%m-%d %H:%M', local)} 星期{weekday}。"
-        return base + now_line + self._memory.prompt_line() + ACTION_PROMPT_GUIDE
+        phrase = self._companion_phrase()
+        phrase_line = f"\n此刻情境：{phrase}。说话与行动都贴合这个情境。" if phrase else ""
+        reunion = self._companion.reunion_prompt_hint()
+        cfg = self._config.assistant
+        knowledge = ""
+        if cfg.enabled and cfg.knowledge_enabled and self._pending_query:
+            try:
+                knowledge = self._knowledge.prompt_context(
+                    self._pending_query, top_k=int(cfg.knowledge_top_k))
+            except (OSError, ValueError):
+                logger.debug("knowledge context failed", exc_info=True)
+        # 长期事实放最后：弱模型对系统提示词尾部更敏感，别被中间的引导语稀释
+        return (base + now_line + phrase_line
+                + self._companion.prompt_line() + knowledge + reunion
+                + self._fact_hygiene_line() + self._memory_guidance_line()
+                + self._web_capability_line() + ACTION_PROMPT_GUIDE
+                + self._memory.prompt_line())
+
+    def _memory_guidance_line(self) -> str:
+        """记忆检索引导：上下文窗口有限，提到旧话题时让模型主动查全量历史。"""
+        if not (self._config.assistant.enabled
+                and self._config.assistant.tool_calling_enabled):
+            return ""
+        return ("\n记忆检索：用户说过的稳定事实会自动抽取并出现在提示词末尾的"
+                "【长期记忆 · 权威事实】里，回答涉及本人的问题先以它为准。"
+                "更早的原话全量存在本机聊天记录，但不在上下文里；用户提到"
+                "「之前 / 上次 / 记得吗 / 我说过 / 那天」或这里找不到答案时，"
+                "先调 search_history 跨日检索（关键词用用户提到的实词，可换词多查），"
+                "必要时再 recall_memories；基于真实结果回答，查不到就直说想不起来。"
+                "用户新陈述了重要事实而【长期记忆】里还没有时，可调用 remember 记下。")
 
     def _brain_source(self) -> str:
         """当前由谁作答：与 ChatService._brain_source 判据一致（只看 api_key）。"""
-        return "ai" if self._config.ai.configured else "local"
+        return "ai" if self._effective_ai().configured else "local"
+
+    def _fact_hygiene_line(self) -> str:
+        """事实边界：弱模型面对模糊输入容易即兴编造具体事实（真机「那年」实测）。"""
+        return ("\n事实边界：没有依据的具体事实（年份、日期、数字、店名、地址、"
+                "身世经历）一律不要编造，哪怕是开玩笑也不行；"
+                "不知道就直说不知道，或者反问用户想聊什么。")
+
+    def _web_capability_line(self) -> str:
+        """联网能力声明：抵消历史里「查不到/没能力」旧回复对模型的误导。"""
+        if not self._config.web_search.enabled:
+            return ""
+        has_amap = bool(self._config.web_search.amap_key.strip())
+        tip = ("你有 web_search（查网页资讯）、get_location（取所在位置）、"
+               "nearby_pois（查附近店铺）等工具。需要最新信息或本地信息时"
+               "必须先调工具，不要凭旧对话说「查不到/没有这个能力」。"
+               "特别重要：报告具体的餐厅/店铺名之前，必须来自工具返回的真实"
+               "结果；没有工具结果时只能泛泛介绍，绝不能编造店名。")
+        if has_amap:
+            tip += ("用户已配置高德 Key：问「附近的xx」时先 get_location "
+                    "再用 nearby_pois 查真实店铺。")
+        else:
+            tip += ("查附近店铺需要用户在设置里填高德 Key（免费），"
+                    "用户问起时引导配置。")
+        return "\n能力提示：" + tip
 
     def _restore_chat_session(self) -> None:
         """把已落盘的最近对话回灌 ChatSession：重启后宠物仍记得聊过什么。
@@ -654,16 +984,31 @@ class PetApplication:
                 restored += 1
             except ValueError:
                 continue
+        # 会话摘要（v1.31）：当天更早、已被 max_turns 截掉的轮次补进摘要缓冲，
+        # 资料拼够后异步压缩——重启不会「忘了今天开头聊了什么」
+        self._summary.reconcile(self._chat_history.today(),
+                                [(t.role, t.content) for t in self._session.turns])
         self._chat_input.set_history_count(len(self._chat_history.today()))
         logger.info("chat session restored turns=%d kept=%d max_turns=%d",
                     restored, len(self._session.turns), self._session.max_turns)
+
+    def _observe_summary(self, role: str, content: str) -> None:
+        """每轮对话扇出给两个记忆消费者（worker 线程回调，只动内存与落盘）。"""
+        self._summary.observe(role, content)
+        self._auto_facts.observe(role, content)
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """资料索引的语义向量：语义开关关 / 未配 embedding 模型时抛错（降级纯关键词）。"""
+        if not self._config.assistant.semantic_search:
+            raise ValueError("语义检索未开启")
+        return self._ai_client.embeddings(texts, self._effective_ai())
 
     def _log_chat_brain(self, when: str) -> None:
         """把“这条回复由谁作答”说清楚（PRD v1.6 C8）。
 
         本地小脑的回复也是逐段上屏，看气泡分不出来源，所以启动与改配置时各提一行。
         """
-        ai = self._config.ai
+        ai = self._effective_ai()
         if ai.configured:
             logger.info("chat brain=ai when=%s model=%s base_url=%s", when, ai.model, ai.base_url)
         else:
@@ -757,8 +1102,18 @@ class PetApplication:
         if not str(text or "").strip() and not attachments:
             logger.debug("blank message dropped")
             return
+        # 完成信号是「顺带消解」，不阻断正常聊天：惦记与 followup 托付同时收尾
+        if is_done_signal(text):
+            self._companion.resolve(text)
+            self._tasks.resolve(text)
         if not attachments:
-            # 快速通道：专注番茄钟 / 取消提醒 / 每日提醒 / 一次性提醒，均不进 AI
+            # 快速通道：托付 / 专注 / 取消提醒 / 每日提醒 / 一次性提醒，均不进 AI
+            assistant_cfg = self._config.assistant
+            if assistant_cfg.enabled and assistant_cfg.tasks_enabled:
+                task = parse_task_command(text, now=self._clock.now())
+                if task is not None:
+                    self._handle_quick_task(text, task)
+                    return
             focus_min = parse_focus_command(
                 text, default_min=self._config.focus.default_min)
             if focus_min is not None:
@@ -778,6 +1133,8 @@ class PetApplication:
             if quick_action is not None:
                 self._handle_quick_reminder(text, quick_action)
                 return
+        # 无参的 system_prompt_provider 拿不到当前问题：缓存一次供 RAG 检索用
+        self._pending_query = str(text or "")
         if not self._chat.send(text, attachments):
             logger.debug("blank message dropped")
             return
@@ -802,6 +1159,40 @@ class PetApplication:
                                                 ts=time.time(), session_id=sid))
         self._controller.speak(confirm, source="system")
         logger.info("quick reminder scheduled: %s", describe_action(action))
+
+    def _handle_quick_task(self, text: str, task) -> None:
+        """托付快速通道：本地解析直接建任务，双向落聊天记录 + 气泡确认。"""
+        accepted = self._tasks.add(task)
+        confirm = ("好，我记下了，替你盯着～" if accepted
+                   else "手上托付太多啦，先取消几个再来～")
+        ts = time.time()
+        sid = day_key(ts)
+        self._bus.publish(ChatTurnRecordedEvent(role="user", content=text,
+                                                source="user", ts=ts, session_id=sid))
+        self._bus.publish(ChatTurnRecordedEvent(role="assistant", content=confirm,
+                                                source="system",
+                                                ts=time.time(), session_id=sid))
+        self._telemetry.once("first_task_done")
+
+    def _rebuild_knowledge(self, *, silent: bool = False) -> None:
+        """重读用户指定的本机文件夹建索引；失败给出人话而不是静默。"""
+        cfg = self._config.assistant
+        if not cfg.knowledge_dir:
+            if not silent:
+                self._report("先在设置 →「体验与隐私」里指定资料文件夹。")
+            return
+        try:
+            result = self._knowledge.build(cfg.knowledge_dir,
+                                           now=self._clock.now())
+        except (ValueError, OSError) as exc:
+            logger.warning("knowledge index build failed: %s", exc)
+            if not silent:
+                self._report(f"索引没建成：{exc}")
+            return
+        logger.info("knowledge index rebuilt: %s", result)
+        if not silent:
+            self._report(f"读完 {result['files']} 个文件、{result['chunks']} 个片段，"
+                         f"索引只存在本机。")
 
     # ---------- v2.0/v2.1：勿扰时段 · 番茄钟 · 统计 · 截图问答 ----------
 
@@ -836,9 +1227,22 @@ class PetApplication:
         self._growth.on_feed()
 
     def _on_pet_head(self) -> None:
-        """抚摸：提升心情 + 成长积分。"""
-        self._controller.pet_head()
+        """抚摸：关系感开启时真的打断当下行为（伸个懒腰蹭回来），否则沿用旧版只加心情。"""
+        cfg = self._config.companion
+        if cfg.enabled and cfg.interactive:
+            self._controller.interact("pet")
+        else:
+            self._controller.pet_head()
         self._growth.on_pet()
+
+    def _call_pet(self) -> None:
+        """叫一声：打断它此刻在做什么，让它抬头看你 + 应一声（命令面板 / 快捷键入口）。"""
+        cfg = self._config.companion
+        if not (cfg.enabled and cfg.interactive):
+            self._controller.speak("我在呢！", source="pet")
+            return
+        if self._controller.interact("call"):
+            self._telemetry.track("feat:user_call")
 
     def _append_focus_entry(self, entry: dict) -> None:
         path = self._config_repo.path.parent / "focus.json"
@@ -970,6 +1374,10 @@ class PetApplication:
         if event.done:
             self._streaming = False
             self._telemetry.once("first_chat_done")
+            # agent 工具循环产出的待确认动作：直接走主线程确认链路（跳过 JSON 解析）
+            if getattr(event, "pending_action", None) is not None:
+                self._handle_action(event.pending_action)
+                return
             action = parse_action(event.reply)
             if action is not None:
                 self._handle_action(action)   # 模型返回的是操作指令，不当文本展示
@@ -989,6 +1397,38 @@ class PetApplication:
         """本地小脑解析出的定时提醒（worker 线程回调；只发布事件，不碰 ui）。"""
         self._one_shot.schedule(action)
         logger.info("one-shot reminder scheduled: %s", describe_action(action))
+
+    def _ask_location_consent(self) -> bool:
+        """位置授权弹窗（主线程执行；worker 线程经桥阻塞等待结果）。
+
+        三选一：仅本次允许 / 总是允许（写进 config.location.consent）/
+        拒绝（同样记住选择，下次不再打扰）。返回 True 表示本次放行。
+        """
+        box = QMessageBox(self._window)
+        box.setWindowTitle("位置权限")
+        box.setText("小墨想获取你的大致位置（IP 城市级），用来查「附近」的信息。"
+                    "只取城市，不会上传聊天内容。")
+        allow_once = box.addButton("仅本次允许", QMessageBox.AcceptRole)
+        allow_always = box.addButton("总是允许", QMessageBox.YesRole)
+        deny = box.addButton("拒绝", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is allow_always:
+            self._remember_location_consent("granted")
+            return True
+        if clicked is deny:
+            self._remember_location_consent("denied")
+            return False
+        return clicked is allow_once
+
+    def _remember_location_consent(self, consent: str) -> None:
+        """把「总是允许 / 拒绝」持久化进 config.json，下次不再弹窗。"""
+        try:
+            self._config.location.consent = consent
+            self._config_repo.save(self._config)
+            logger.info("location consent persisted: %s", consent)
+        except OSError:
+            logger.exception("failed to persist location consent")
 
     def _handle_action(self, action) -> None:
         """执行模型返回的操作意图：提醒直接排期；写盘类按权限预览→确认→可撤销。"""
@@ -1100,7 +1540,7 @@ class PetApplication:
 
     def _generate_cheer(self) -> str | None:
         """鼓励语生成：AI 在线就出一句古诗名句/夸奖；未配置或失败返回 None（走本地语录）。"""
-        ai = self._config.ai
+        ai = self._effective_ai()
         if not ai.configured:
             return None
         prompt = (f"你是桌面宠物「{self._pet.name}」。随机来一句给主人的积极话语："
@@ -1119,10 +1559,11 @@ class PetApplication:
         超时钳到 GREETING_TIMEOUT_S（远小于聊天默认的 30s），网关慢/不通时快速放弃、
         由 _greeting_text 回落兜底语，保证问候几秒内必达。
         """
-        ai = self._config.ai
+        ai = self._effective_ai()
         if not ai.configured:
             return None
-        prompt = (f"你是桌面宠物「{self._pet.name}」，主人刚把你打开。"
+        hint = self._companion.reunion_prompt_hint()
+        prompt = (f"你是桌面宠物「{self._pet.name}」，主人刚把你打开。{hint}"
                   f"来一句积极昂扬、简短有力的开场口号，唤醒主人元气满满地开启新一天，"
                   f"不超过30字，直接输出正文，不要解释：")
         greet_ai = replace(ai, timeout_s=min(ai.timeout_s, GREETING_TIMEOUT_S))
@@ -1135,7 +1576,14 @@ class PetApplication:
         return slogan[:60] or None
 
     def _greeting_text(self) -> str:
-        """问候正文：AI 口号优先；未连模型或生成失败时，用宠物名兜底问候。"""
+        """问候正文：久别重逢优先（本地确定、秒出）；否则 AI 口号 / 兜底语。
+
+        久别时不再等 AI：用户要的是「它真的说得出这几天你没在」，
+        而不是 2 秒后一句可能完全没提这件事的口号。
+        """
+        reunion = self._companion.reunion_text()
+        if reunion:
+            return reunion
         return (self._generate_greeting()
                 or STARTUP_GREETING_FALLBACK.format(name=self._pet.name))
 
@@ -1148,14 +1596,16 @@ class PetApplication:
             except Exception:  # noqa: BLE001 - 问候必达，任何异常都退回兜底语
                 logger.exception("greeting generation failed")
                 text = STARTUP_GREETING_FALLBACK.format(name=self._pet.name)
+            title = ("好久不见" if self._companion.reunion_text()
+                     else "开启新的一天")
             self._bus.publish(SpeakRequestedEvent(text, source="cheer",
-                                                  title="开启新的一天"))
+                                                  title=title))
 
         threading.Thread(target=_work, name="wisepet-greet", daemon=True).start()
 
     def _summarize_news(self, headlines: list[str]) -> str | None:
         """新闻标题 → AI 摘要；未配 Key 或失败时返回 None（走纯标题播报）。"""
-        ai = self._config.ai
+        ai = self._effective_ai()
         if not ai.configured:
             return None
         listing = "\n".join(f"- {title}" for title in headlines)
@@ -1169,7 +1619,7 @@ class PetApplication:
 
     def _summarize_week(self, stats: dict) -> str | None:
         """本周统计 → AI 润色成宠物口吻的周报；未配 Key 或失败返回 None（走本地模板）。"""
-        ai = self._config.ai
+        ai = self._effective_ai()
         if not ai.configured:
             return None
         facts = [f"本周我们聊了 {stats.get('messages', 0)} 句",
@@ -1204,7 +1654,7 @@ class PetApplication:
 
     def _announce_reminder(self, text: str, title: str = "提醒") -> None:
         """提醒播报：配了 AI 就后台润色成人设口吻；失败/未配置退回原文（必响）。"""
-        ai = self._config.ai
+        ai = self._effective_ai()
         if not ai.configured:
             self._bus.publish(SpeakRequestedEvent(text, source="reminder", title=title))
             return
@@ -1225,7 +1675,7 @@ class PetApplication:
 
     def _polish_reminder_text(self, text: str) -> str | None:
         """把提醒话术润色成宠物人设口吻；未配 Key 或失败返回 None（回落原文）。"""
-        ai = self._config.ai
+        ai = self._effective_ai()
         if not ai.configured:
             return None
         prompt = (f"你是桌面宠物「{self._pet.name}」，要用俏皮亲切的口吻提醒主人。"
@@ -1251,8 +1701,25 @@ class PetApplication:
         dialog = SettingsDialog(self._config, on_saved=self.apply_config,
                                 skin_options=self._available_skins(),
                                 screen_bounds=self._screen,
-                                parent=self._window)
+                                parent=self._window,
+                                is_manager=self._is_manager(),
+                                profile_name=self._profile,
+                                on_change_pin=self._change_my_pin)
         dialog.exec()
+
+    def _change_my_pin(self) -> None:
+        """当前身份的 PIN 设置/修改/解除（picker 与设置窗共用同一流程）。"""
+        from WisePet.ui.profile_picker import change_pin_flow
+        if change_pin_flow(self._window, ProfileStore(default_data_dir()),
+                           self._profile):
+            self._controller.speak("PIN 已经更新好啦～", source="pet")
+
+    def _is_manager(self) -> bool:
+        """管理员 = 默认身份（最早使用、不可删除）；管理动作（共享 AI）专属。"""
+        return ProfileStore(default_data_dir()).is_manager(self._profile)
+
+    def _profile_name(self) -> str:
+        return ProfileStore(default_data_dir()).active()
 
     def _available_skins(self) -> list[str]:
         """素材齐全的皮肤（没生成狗/猴素材时设置窗不会列出它们）。"""
@@ -1271,6 +1738,7 @@ class PetApplication:
         """保存后热生效：配置替换 + 会话上限 + 提醒重新排期 + 皮肤热切换。"""
         previous_skin = self._config.pet.skin
         previous_system = self._config.system
+        previous_assistant = self._config.assistant
         self._config = config
         self._config_repo.save(config)
         self._set_chat_state(PHASE_IDLE, self._brain_source())
@@ -1284,6 +1752,20 @@ class PetApplication:
             self._reminder.set_interval(kind, float(item.interval_min))
         self._news.reschedule()      # 新闻间隔变化立即生效，不等旧周期
         self._cheer.reschedule()     # 鼓励间隔同理
+        # 资料文件夹/开关变了就重建索引；关掉时清掉旧索引，不残留用户文件片段
+        if config.assistant != previous_assistant:
+            if not config.assistant.enabled or not config.assistant.knowledge_enabled:
+                self._knowledge.clear()
+            elif config.assistant.knowledge_dir:
+                self._rebuild_knowledge(silent=True)
+        # 家庭共享 AI（管理员专属）：勾选 → 当前生效配置写入全局共享文件；取消 → 清除
+        if config.assistant.share_family_ai != previous_assistant.share_family_ai:
+            if config.assistant.share_family_ai:
+                self._shared_ai.save(self._effective_ai())
+                logger.info("family shared AI updated by manager")
+            else:
+                self._shared_ai.clear()
+                logger.info("family shared AI cleared")
         logger.info("config applied: model=%s skin=%s walk=%.0fpx/s",
                     config.ai.model, config.pet.skin, config.pet.walk_speed_px_per_s)
         self._sync_model_combo()
@@ -1310,7 +1792,7 @@ class PetApplication:
         self._chat_input.set_models(names, active)
 
     def _active_profile_name(self) -> str:
-        ai = self._config.ai
+        ai = self._effective_ai()
         for profile in self._config.ai_profiles:
             if (profile.base_url == ai.base_url and profile.model == ai.model
                     and profile.api_key == ai.api_key):
@@ -1324,7 +1806,8 @@ class PetApplication:
             logger.debug("model profile not found: %s", name)
             return
         ai = replace(self._config.ai, base_url=profile.base_url,
-                     api_key=profile.api_key, model=profile.model)
+                     api_key=profile.api_key, model=profile.model,
+                     embedding_model=profile.embedding_model)
         if ai == self._config.ai:
             return
         logger.info("model switched via chat window: %s (%s)", name, profile.model)
@@ -1348,14 +1831,60 @@ class PetApplication:
         else:
             self._animator.start()
             self._sync_window()
-            self._play_tech_effect("spawn", on_done=self._fade_in_pet)
+            self._enter_pet("toggle")
 
-    # ---------- 科技感出场/退场特效 ----------
+    # ---------- 宠物登场/退场特效 ----------
 
-    def _play_tech_effect(self, mode: str, on_done: Callable[[], None] | None = None) -> None:
-        """在宠物中心播放粒子特效；on_done 特效结束后回调（主线程）。"""
+    def _enter_kind_for(self, trigger: str) -> str:
+        """登场特效种类：
+
+        - 配置为具体 kind → 固定用之
+        - 配置为 ``random`` → 每次从 7 种里随机（ink 已重做为能量波纹，不再排除）
+        - 配置为 ``auto``（默认）→ 按场景分派；其中「从托盘恢复」(toggle)
+          随机选一种，满足「隐藏/出现也要随机」的诉求，其余场景仍固定可解释
+        """
+        pref = getattr(self._config.pet, "enter_effect", "auto")
+        if pref == "random":
+            return random_enter_kind()
+        if pref in ENTER_KINDS:
+            return pref
+        if trigger == "toggle":
+            return random_enter_kind()
+        return TRIGGER_ENTER_KIND.get(trigger, "spawn")
+
+    def _enter_pet(self, trigger: str, after: Callable[[], None] | None = None) -> None:
+        """统一登场：窗口透明→播放对应进入特效→结束淡入（after 在淡入后执行）。"""
+        kind = self._enter_kind_for(trigger)
+        self._window.setWindowOpacity(0.0)
+        self._window.show()
+        self._window.raise_()
+
+        def _on_done() -> None:
+            self._fade_in_pet()
+            if after is not None:
+                after()
+
+        self._play_tech_effect(kind, on_done=_on_done)
+
+    def _play_effect_only(self, trigger: str) -> None:
+        """宠物已可见时，仅播放对应特效层作「随触发」反馈，不重播登场（不闪烁）。"""
+        kind = self._enter_kind_for(trigger)
+        prev = getattr(self, "_tech_effect", None)
+        if prev is not None:
+            prev.stop()      # 仅清掉上一个反馈层，不影响宠物显形
+        self._play_tech_effect(kind)
+
+    def _play_or_enter(self, trigger: str) -> None:
+        """触发场景：隐藏则登场（带特效+淡入），已可见则仅播特效层作反馈。"""
+        if not self._window.isVisible():
+            self._enter_pet(trigger)
+        else:
+            self._play_effect_only(trigger)
+
+    def _play_tech_effect(self, kind: str, on_done: Callable[[], None] | None = None) -> None:
+        """在宠物中心播放特效；kind 决定样式（进入种类 / "exit" 退场），on_done 结束后回调。"""
         center = self._window.frameGeometry().center()
-        effect = TechEffect(center, mode=mode)
+        effect = TechEffect(center, kind=kind)
         self._tech_effect = effect             # 持引用防回收
         if on_done is not None:
             effect.finished.connect(on_done)
@@ -1385,6 +1914,11 @@ class PetApplication:
             self._app.quit()
 
     def _sync_window(self) -> None:
+        # C++ 对象可能先于 Python 包装被销毁（teardown 竞态/系统销毁窗口）：
+        # 此刻一切 move/anchor 都没有意义，跳过并让运动计时器自行关闭
+        if not isValid(self._window):
+            self._motion_timer and self._motion_timer.stop()
+            return
         self._window.sync_from_pet()
         # 气泡只要开着就跟着宠物走：提醒/求助/回复都不脱离猫的位置（跟随状态）
         if self._bubble.isVisible():
@@ -1410,29 +1944,72 @@ class PetApplication:
         return self._window
 
 
+def select_startup_profile(profiles, requested: str) -> str | None:
+    """启动身份选择：返回身份名；返回 None 表示用户取消（Esc/关闭），不启动。
+
+    - `--profile=名字` 显式指定时不弹窗，取消语义不适用；
+    - 没有自建身份且无 active 的老用户直接进入默认身份，零打扰；
+    - 弹了「谁来了？」就必须**显式选一个**（或点「沿用上次身份」）；
+      Esc / 关窗一律取消启动，不再隐式落到管理员身份（真机 bug 修复）。
+    """
+    current = requested or profiles.active()
+    if requested or not (profiles.list() or current):
+        return current
+    picker = ProfilePickerDialog(profiles, current=current)
+    if picker.exec() != QDialog.DialogCode.Accepted or picker.selected is None:
+        return None
+    name = picker.selected
+    if name:
+        profiles.set_active(name)
+    else:
+        profiles.clear_active()
+    return name
+
+
 def main() -> int:
-    """入口：单实例互斥 → 日志 → 装配 → 启动 → 事件循环。"""
+    """入口：身份（profile）→ 单实例互斥 → 日志 → 装配 → 启动 → 事件循环。"""
     started_at = time.monotonic()
     app = QApplication(sys.argv)
     app.setApplicationName("WisePet")
 
+    # 本地身份（v1.31）：`--profile=名字` 优先，否则用上次切换时记住的名字；
+    # 空身份 = 默认数据目录（老用户零迁移）
+    base_dir = default_data_dir()
+    profiles = ProfileStore(base_dir)
+    requested = ""
+    for arg in sys.argv[1:]:
+        if arg.startswith("--profile="):
+            try:
+                requested = safe_profile_name(arg.split("=", 1)[1])
+            except ValueError as exc:
+                QMessageBox.warning(None, "WisePet", f"身份名不合法：{exc}")
+                return 1
+    profile_name = select_startup_profile(profiles, requested)
+    if profile_name is None:                # Esc / 关窗：不进任何身份，直接退出
+        return 0
+    if profile_name:
+        profiles.ensure(profile_name)        # 先建目录，迁移与配置都落到里面
+
     global _instance_guard
-    _instance_guard = InstanceGuard()
+    _instance_guard = InstanceGuard(port=guard_port_for(profile_name))
     if not _instance_guard.acquire():
         QMessageBox.warning(None, "WisePet", "已经有一个桌宠在跑啦，不再重复启动。")
         return 1
 
-    migrated = migrate_legacy_data()
+    data_dir = profiles.data_dir_for(profile_name)
+    migrated = migrate_legacy_data(data_dir)
     # 日志装配要先读到「系统配置」分区里的级别/阈值/保留期，再挂 handler
-    boot_config = JsonConfigRepository().load()
-    log_file = setup_logging(system=boot_config.system)
-    logger.info("bootstrapping (log=%s)", log_file)
+    config_repo = JsonConfigRepository(data_dir)
+    boot_config = config_repo.load()
+    log_file = setup_logging(system=boot_config.system, data_dir=data_dir)
+    logger.info("bootstrapping (log=%s, profile=%s)", log_file, profile_name or "默认")
     if migrated:
         logger.info("legacy data migrated from ~/.ai-bot: %s", migrated)
 
     # 首次运行判定放在真实入口：组装测试构造 PetApplication 时 onboarding 默认 False
-    onboarding = not (JsonConfigRepository().path.parent / "onboarding.done").exists()
-    pet_app = PetApplication(app, onboarding=onboarding)
+    onboarding = not (config_repo.path.parent / "onboarding.done").exists()
+    pet_app = PetApplication(app, onboarding=onboarding,
+                             config_repo=config_repo, profile=profile_name)
     app.aboutToQuit.connect(pet_app.shutdown)
     pet_app.start()
     logger.info("cold start took %.2fs (target <3s)", time.monotonic() - started_at)

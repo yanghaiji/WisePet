@@ -2,6 +2,7 @@
 
 替代单行 QLineEdit：长文本按控件宽度自动折行，行数多了往上长（封顶 _MAX_LINES），
 不出现横向滚动条。text()/setText() 与 QLineEdit 同名兼容，存量测试与调用方无感。
+支持把文件直接拖进输入框（files_dropped 信号交外部转附件，与 📎 按钮同一链路）。
 """
 from __future__ import annotations
 
@@ -9,7 +10,12 @@ from PySide6.QtCore import QBuffer, QIODevice, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QTextOption
 from PySide6.QtWidgets import QTextEdit
 
-from ..domain.attachment import attachment_from_png_bytes
+from ..domain.attachment import (
+    MAX_ATTACHMENTS,
+    Attachment,
+    attachment_from_png_bytes,
+    load_attachment,
+)
 
 #: 最多长到几行，再往后内部滚动
 _MAX_LINES = 6
@@ -29,8 +35,32 @@ def attachment_from_clipboard_image(image: QImage):
         return None
 
 
+def attachments_from_paths(paths) -> tuple[list[Attachment], str | None]:
+    """拖放/选择的文件路径 → 附件列表；超限或类型不合法时附带错误文案。
+
+    已合法的附件照常收下，错误只描述没收下的那部分（拖一批文件不全白拖）。
+    """
+    out: list[Attachment] = []
+    for path in paths:
+        if len(out) >= MAX_ATTACHMENTS:
+            return out, f"一次最多 {MAX_ATTACHMENTS} 个附件"
+        try:
+            out.append(load_attachment(path))
+        except ValueError as exc:
+            return out, str(exc)
+    return out, None
+
+
+def local_file_paths(mime_data) -> list[str]:
+    """mimeData 里的本地文件路径列表（没有本地文件返回空）。"""
+    if mime_data is None or not mime_data.hasUrls():
+        return []
+    return [url.toLocalFile() for url in mime_data.urls() if url.isLocalFile()]
+
+
 class ChatTextEdit(QTextEdit):
-    """Enter 发送 / Shift+Enter 换行的自增高多行输入框；Ctrl+V 可直接贴截图。"""
+    """Enter 发送 / Shift+Enter 换行的自增高多行输入框；Ctrl+V 可直接贴截图，
+    文件可直接拖进来（files_dropped 交外部转附件）。"""
 
     #: 用户按了回车 → 外部执行发送
     send_requested = Signal()
@@ -38,9 +68,12 @@ class ChatTextEdit(QTextEdit):
     dismissed = Signal()
     #: 剪贴板里是图片时按下 Ctrl+V → 外部转成附件（文本粘贴走默认路径）
     image_pasted = Signal(QImage)
+    #: 文件拖进输入框 → 外部转成附件（路径列表）
+    files_dropped = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)   # 中英混排不出现横向滚动
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -78,6 +111,28 @@ class ChatTextEdit(QTextEdit):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    # ---------- 文件拖放 ----------
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        if local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)     # 文本/富文本拖放走 QTextEdit 默认路径
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        if local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        paths = local_file_paths(event.mimeData())
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
     # ---------- 内部 ----------
 

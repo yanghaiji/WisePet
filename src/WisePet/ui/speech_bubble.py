@@ -3,25 +3,29 @@
 每条通知是一张独立小卡（标题 + 正文 + 可选「知道啦」），多条同时出现时垂直
 堆叠、按标题区分，关一条不影响其它；提醒类 15s 未确认自动消失。
 AI 流式回复也是一张卡：begin_stream 建卡、append_chunk 节流刷新、end_stream 定时收场。
-文本一律按纯文本渲染，AI 返回的 markdown 不做解析（PRD M4 边界）。
+正文完整渲染 markdown（标题/加粗/代码块/表格/链接等，mistune 转义防注入）；
+右下角尺寸手柄可拖拽调整宽度（用户改过之后自动布局不再覆盖宽度）。
 """
 from __future__ import annotations
 
 import logging
 from typing import Callable
 
-from PySide6.QtCore import QTimer, QPoint, Qt
+from PySide6.QtCore import QRect, QSize, QTimer, QPoint, Qt
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
+from .markdown_render import render_markdown
+from .resize_grip import ResizeGrip
 from .screen_bounds import ScreenBounds
 
 logger = logging.getLogger(__name__)
 
 #: 卡片外观尺寸
 _BUBBLE_PAD = 12
-_CARD_WIDTH = 320
+_CARD_WIDTH = 320            # 默认宽度
+_CARD_MIN_WIDTH = 240        # 用户可往窄里拖的下限
 #: 卡片底部与宠物头顶锚点之间的留白（替代原来的三角尾巴）
 _ANCHOR_GAP = 12
 
@@ -72,6 +76,8 @@ QPushButton#ack {
 QPushButton#ack:hover { background: #F3D9A8; }
 """
 
+#: 轻量 markdown 转换已被 ui/markdown_render.py 的完整渲染取代（mistune）。
+
 
 class _Card:
     """一张通知卡：标题 + 正文 + 可选「知道啦」+ 独立自动消失计时。"""
@@ -85,16 +91,22 @@ class _Card:
 
         self.frame = QFrame(parent)
         self.frame.setObjectName("bubbleCard")
-        self.frame.setFixedWidth(_CARD_WIDTH)
+        self.frame.setMinimumWidth(_CARD_MIN_WIDTH)   # 宽度随窗口/内容伸缩
 
         self.title_label = QLabel(title, self.frame)
         self.title_label.setObjectName("bubbleTitle")
         self.dot = QLabel("●", self.frame)
         self.dot.setObjectName("bubbleDot")
-        self.text_label = QLabel(text, self.frame)
+        self.text_label = QLabel(self.frame)
         self.text_label.setObjectName("bubbleText")
         self.text_label.setWordWrap(True)
-        self.text_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.text_label.setTextFormat(Qt.TextFormat.RichText)
+        self.text_label.setOpenExternalLinks(True)   # markdown 链接可点击（外部浏览器）
+        self.text_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.raw_text = text                    # 原文（markdown 未转换），current_text 用
+        self.text_label.setText(render_markdown(text))
 
         self.ack_btn = QPushButton("知道啦", self.frame)
         self.ack_btn.setObjectName("ack")
@@ -128,11 +140,14 @@ class SpeechBubble(QWidget):
 
     def __init__(self, screen_bounds: ScreenBounds | None = None,
                  parent: QWidget | None = None,
-                 duration_provider: Callable[[], float] | None = None):
+                 duration_provider: Callable[[], float] | None = None,
+                 avoid_provider: Callable[[], QRect] | None = None):
         super().__init__(parent)
         self._screen = screen_bounds
         # 统一驻留时长（秒）：设置里配一个值管所有提示；不注入则按来源内置时长
         self._duration_provider = duration_provider
+        #: 宠物窗口矩形提供方：气泡默认放头顶，放不下时挪到宠物侧面不挡它
+        self._avoid_provider = avoid_provider
         self._anchor = QPoint()
         self._cards: dict[int, _Card] = {}
         self._order: list[int] = []            # 卡片显示顺序（旧→新）
@@ -140,6 +155,12 @@ class SpeechBubble(QWidget):
         self._stream_id: int | None = None
         self._stream_buffer: list[str] = []
         self._stream_on_close: Callable[[], None] | None = None
+        self._user_resized = False      # 用户拖过手柄后，自动布局不再覆盖宽度
+
+        # 右下角尺寸手柄：无边框窗口没有系统边框，拖它调整大小
+        self._grip = ResizeGrip(self)
+        self._grip.min_size = QSize(_CARD_MIN_WIDTH, 48)
+        self._grip.user_resized.connect(lambda: setattr(self, "_user_resized", True))
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -230,10 +251,10 @@ class SpeechBubble(QWidget):
             self._place_and_show()
 
     def current_text(self) -> str:
-        """最新一张卡的正文（测试与调试用）。"""
+        """最新一张卡的正文原文（未转 HTML；测试与调试用）。"""
         if not self._order:
             return ""
-        return self._cards[self._order[-1]].text_label.text()
+        return self._cards[self._order[-1]].raw_text
 
     @property
     def cards(self) -> list[_Card]:
@@ -286,7 +307,8 @@ class SpeechBubble(QWidget):
             self.hide()
 
     def _set_card_text(self, card: _Card, text: str) -> None:
-        card.text_label.setText(text)
+        card.raw_text = text
+        card.text_label.setText(render_markdown(text))
 
     # ---------- 内部：流式与布局 ----------
 
@@ -312,14 +334,63 @@ class SpeechBubble(QWidget):
         by_length = _MIN_DURATION_MS + _PER_CHAR_MS * len(text)
         return max(_MIN_DURATION_MS, min(base, by_length))
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 重写
+        """尺寸手柄贴右下角并置顶（卡片是后加的子控件，不置顶会盖住手柄）。"""
+        self._grip.move(self.width() - 16, self.height() - 16)
+        self._grip.raise_()
+        super().resizeEvent(event)
+
     def _place_and_show(self) -> None:
-        """堆叠所有卡片并定位到宠物头顶（先让布局算好尺寸再摆）。"""
-        self.adjustSize()
-        width, height = self.width(), self.height()
-        x = self._anchor.x() - width // 2
-        y = self._anchor.y() - height - _ANCHOR_GAP
-        if self._screen is not None:
-            x, y = self._screen.clamp(x, y, width, height)  # 不超出工作区（PRD 边界）
-        self.move(x, y)
+        """堆叠所有卡片并定位（先让布局算好尺寸再摆）。
+
+        宽度：默认 _CARD_WIDTH；用户拖过手柄后尊重用户宽度（不小于下限）。
+        高度：按宽度 heightForWidth 算（换行文本随宽度变化）。
+        位置：首选宠物头顶居中；与宠物窗口重叠时改为贴到宠物左/右侧
+        （居中对齐宠物高度）；两侧都放不下才退回头顶位置。
+        """
+        if self._user_resized and self.isVisible():
+            width = max(self.width(), _CARD_MIN_WIDTH)
+        else:
+            width = _CARD_WIDTH
+        layout = self.layout()
+        if layout is not None and layout.hasHeightForWidth():
+            height = max(self.heightForWidth(width), 48)
+        else:
+            height = max(self.sizeHint().height(), 48)
+        self.resize(width, height)
+
+        ax, ay = self._anchor.x(), self._anchor.y()
+        avoid: QRect | None = None
+        if self._avoid_provider is not None:
+            try:
+                avoid = self._avoid_provider()
+            except Exception:  # noqa: BLE001 - 几何回调异常不挡气泡显示
+                logger.exception("avoid provider failed")
+                avoid = None
+        if avoid is not None and (avoid.width() <= 0 or avoid.height() <= 0):
+            avoid = None
+
+        # 候选位：头顶居中 → 宠物右侧 → 宠物左侧（与宠物高度居中对齐）
+        candidates = [(ax - width // 2, ay - height - _ANCHOR_GAP)]
+        if avoid is not None:
+            side_y = avoid.y() + avoid.height() // 2 - height // 2
+            candidates.append((avoid.x() + avoid.width() + 10, side_y))
+            candidates.append((avoid.x() - width - 10, side_y))
+
+        chosen: tuple[int, int] | None = None
+        for x, y in candidates:
+            cx, cy = x, y
+            if self._screen is not None:
+                cx, cy = self._screen.clamp(cx, cy, width, height)
+            rect = QRect(cx, cy, width, height)
+            if avoid is None or not rect.intersects(avoid.adjusted(-6, -6, 6, 6)):
+                chosen = (cx, cy)
+                break
+        if chosen is None:                     # 两侧都放不下：退回头顶首选位
+            x, y = candidates[0]
+            if self._screen is not None:
+                x, y = self._screen.clamp(x, y, width, height)
+            chosen = (x, y)
+        self.move(*chosen)
         self.show()
         self.raise_()

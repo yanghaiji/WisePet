@@ -51,6 +51,34 @@ def should_hide_and_dismiss_when_escape(chat_input, qtbot):
     assert not chat_input.isVisible()
 
 
+class TestWindowControls:
+    """v1.33 打磨：— ▢ × 窗口控制按钮 + 右下角拖宽手柄。"""
+
+    def should_have_window_control_buttons(self, chat_input):
+        assert chat_input._min_btn.text() == "—"
+        assert chat_input._max_btn.text() == "▢"
+        assert chat_input._close_btn.text() == "×"
+
+    def should_hide_when_minimize_clicked(self, chat_input):
+        chat_input._min_btn.click()
+        assert not chat_input.isVisible()
+
+    def should_toggle_wide_mode_when_max_clicked(self, chat_input, fake_screen):
+        x1, _y1, x2, _y2 = fake_screen.geometry()
+        chat_input.show_near(QRect(400, 300, 128, 128))
+        chat_input._max_btn.click()
+        assert chat_input._wide and chat_input.width() >= (x2 - x1 + 1) - 24
+        chat_input._max_btn.click()               # 再点还原
+        assert not chat_input._wide and chat_input.width() == 400
+
+    def should_keep_user_width_after_grip_drag(self, chat_input):
+        chat_input.show_near(QRect(400, 300, 128, 128))
+        chat_input.resize(560, chat_input.height())
+        chat_input._grip.user_resized.emit()
+        chat_input.follow_pet(QRect(500, 300, 128, 128))   # 宠物挪窝重新贴边
+        assert chat_input.width() == 560           # 自动贴边不改用户宽度
+
+
 class TestSidePlacement:
     """FR v1.10 C17：左侧优先、右侧兜底，且绝不压在宠物身上。"""
 

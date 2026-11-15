@@ -149,6 +149,17 @@ class OpenAICompatClient:
 
     def complete(self, messages: list[dict], cfg: AIConfig) -> str:
         """非流式对话：后台任务（新闻摘要等）用，一次拿全文。"""
+        content, _calls = self.chat_with_tools(messages, cfg, [])
+        return content
+
+    def chat_with_tools(self, messages: list[dict], cfg: AIConfig,
+                        tools: list[dict]) -> tuple[str, list[dict]]:
+        """非流式带工具定义（OpenAI tools 协议）：返回 (content, tool_calls)。
+
+        content 可为空（模型只请求工具）；tool_calls 已把 arguments 从 JSON
+        字符串解析成 dict。网关不支持 tools（400/422/协议错误）时抛
+        AIGatewayError.PROTOCOL，由上层降级回纯文本协议。
+        """
         if not cfg.configured:
             raise AIGatewayError(AIGatewayError.AUTH, "api_key 未配置")
         payload = {
@@ -157,6 +168,9 @@ class OpenAICompatClient:
             "stream": False,
             "temperature": cfg.temperature,
         }
+        if tools:                              # 空 tools 不下发：兼容挑剔的网关
+            payload["tools"] = list(tools)
+            payload["tool_choice"] = "auto"
         headers = {"Authorization": f"Bearer {cfg.api_key}"}
         try:
             with httpx.Client(timeout=cfg.timeout_s) as client:
@@ -169,12 +183,180 @@ class OpenAICompatClient:
             if hint:
                 raise AIGatewayError(AIGatewayError.PROTOCOL, hint)
             choices = obj.get("choices") or []
-            content = ((choices[0].get("message") or {}).get("content")
-                       if choices else None)
-            if not content:
+            message = (choices[0].get("message") or {}) if choices else {}
+            content = str(message.get("content") or "")
+            calls: list[dict] = []
+            for index, call in enumerate(message.get("tool_calls") or []):
+                fn = call.get("function") or {}
+                raw_args = fn.get("arguments")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except json.JSONDecodeError as exc:
+                    raise AIGatewayError(
+                        AIGatewayError.PROTOCOL,
+                        f"tool arguments 不是 JSON：{str(raw_args)[:80]}") from exc
+                if not isinstance(args, dict):
+                    raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                         "tool arguments 不是 JSON 对象")
+                calls.append({"id": str(call.get("id") or f"call-{index}"),
+                              "name": str(fn.get("name") or ""),
+                              "arguments": args})
+            if not content and not calls:
                 raise AIGatewayError(AIGatewayError.PROTOCOL,
-                                     "响应里没有 choices[0].message.content")
-            return str(content)
+                                     "响应里既没有 content 也没有 tool_calls")
+            return content, calls
+        except AIGatewayError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise AIGatewayError(AIGatewayError.PROTOCOL, f"响应不是 JSON：{exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise AIGatewayError(AIGatewayError.TIMEOUT, str(exc) or exc.__class__.__name__) from exc
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            raise AIGatewayError(AIGatewayError.NETWORK, str(exc)) from exc
+
+    def chat_with_tools_stream(self, messages: list[dict], cfg: AIConfig,
+                               tools: list[dict],
+                               on_content=None) -> tuple[str, list[dict]]:
+        """流式带工具定义：content 增量实时回调 on_content(delta)，返回全文与工具调用。
+
+        agent 循环的最后一轮（模型不再请求工具）通过回调拿到逐字增量，
+        上层据此真流式上屏，消除「工具循环跑完才一次性出字」的卡顿感。
+        delta.tool_calls 按分片聚合（arguments 可能分多个 SSE 片到达）；
+        流式不可用/被网关拒绝时抛 AIGatewayError，由调用方回落非流式。
+        """
+        if not cfg.configured:
+            raise AIGatewayError(AIGatewayError.AUTH, "api_key 未配置")
+        payload = {
+            "model": cfg.model,
+            "messages": messages,
+            "stream": True,
+            "temperature": cfg.temperature,
+        }
+        if tools:
+            payload["tools"] = list(tools)
+            payload["tool_choice"] = "auto"
+        headers = {"Authorization": f"Bearer {cfg.api_key}",
+                   "Accept": _SSE_CONTENT_TYPE}
+        content_parts: list[str] = []
+        # index → {id, name, arguments}：OpenAI 流式协议按 index 分片聚合
+        call_slots: dict[int, dict] = {}
+        try:
+            with httpx.Client(timeout=cfg.timeout_s) as client:
+                with client.stream("POST", cfg.chat_endpoint,
+                                   json=payload, headers=headers) as resp:
+                    self._raise_for_status(resp)
+                    content_type = resp.headers.get("content-type") or ""
+                    if content_type and _SSE_CONTENT_TYPE not in content_type:
+                        body = resp.read().decode("utf-8", "replace")
+                        raise AIGatewayError(
+                            AIGatewayError.PROTOCOL,
+                            _body_error(body) or f"响应不是流式（content-type={content_type}）")
+                    for line in resp.iter_lines():
+                        line = (line or "").strip()
+                        if not line.startswith(_DATA_PREFIX):
+                            continue
+                        data = line[len(_DATA_PREFIX):].strip()
+                        if data == _DONE_MARKER:
+                            break
+                        if not data:
+                            continue
+                        try:
+                            obj = json.loads(data)
+                        except json.JSONDecodeError:
+                            logger.warning("skip malformed SSE payload: %.80s", data)
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        hint = _dict_error(obj)
+                        if hint:
+                            raise AIGatewayError(AIGatewayError.PROTOCOL, hint)
+                        choices = obj.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        text = delta.get("content")
+                        if text:
+                            content_parts.append(text)
+                            if on_content is not None:
+                                on_content(text)
+                        for tc in delta.get("tool_calls") or []:
+                            try:
+                                index = int(tc.get("index") or 0)
+                            except (TypeError, ValueError):
+                                index = 0
+                            slot = call_slots.setdefault(
+                                index, {"id": "", "name": "", "arguments": ""})
+                            if tc.get("id"):
+                                slot["id"] = str(tc["id"])
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] += str(fn["name"])
+                            if fn.get("arguments"):
+                                slot["arguments"] += str(fn["arguments"])
+        except AIGatewayError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise AIGatewayError(AIGatewayError.TIMEOUT, str(exc) or exc.__class__.__name__) from exc
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            raise AIGatewayError(AIGatewayError.NETWORK, str(exc)) from exc
+        content = "".join(content_parts)
+        calls: list[dict] = []
+        for index, slot in sorted(call_slots.items()):
+            raw = slot["arguments"]
+            try:
+                args = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError as exc:
+                raise AIGatewayError(
+                    AIGatewayError.PROTOCOL,
+                    f"流式 tool arguments 不是 JSON：{raw[:80]}") from exc
+            if not isinstance(args, dict):
+                raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                     "tool arguments 不是 JSON 对象")
+            calls.append({"id": slot["id"] or f"call-{index}",
+                          "name": slot["name"],
+                          "arguments": args})
+        if not content and not calls:
+            raise AIGatewayError(
+                AIGatewayError.PROTOCOL,
+                "流式响应里既没有 content 也没有 tool_calls")
+        return content, calls
+
+    def embeddings(self, texts: list[str], cfg: AIConfig) -> list[list[float]]:
+        """OpenAI 兼容 embeddings 批量调用：返回与 texts 等长的向量列表。
+
+        资料索引的语义检索用（v1.31）。错误分类与 complete 一致；空输入直接返回空。
+        """
+        texts = [str(t or "") for t in (texts or [])]
+        if not texts:
+            return []
+        if not cfg.api_key.strip() or not cfg.embedding_model.strip():
+            raise AIGatewayError(AIGatewayError.AUTH,
+                                 "语义检索需要 api_key 与 embedding_model")
+        payload = {"model": cfg.embedding_model, "input": texts}
+        headers = {"Authorization": f"Bearer {cfg.api_key}"}
+        try:
+            with httpx.Client(timeout=cfg.timeout_s) as client:
+                resp = client.post(cfg.embedding_endpoint, json=payload,
+                                   headers=headers)
+            _raise_status_code(resp.status_code)
+            obj = json.loads(resp.text)
+            if not isinstance(obj, dict):
+                raise AIGatewayError(AIGatewayError.PROTOCOL, "响应不是 JSON 对象")
+            hint = _dict_error(obj)
+            if hint:
+                raise AIGatewayError(AIGatewayError.PROTOCOL, hint)
+            data = obj.get("data") or []
+            vectors = []
+            for item in sorted(data, key=lambda d: d.get("index", 0)):
+                vec = item.get("embedding")
+                if not isinstance(vec, list) or not vec:
+                    raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                         "embeddings 返回缺少向量字段")
+                vectors.append([float(x) for x in vec])
+            if len(vectors) != len(texts):
+                raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                     f"向量数量不匹配：{len(vectors)}/{len(texts)}")
+            return vectors
         except AIGatewayError:
             raise
         except json.JSONDecodeError as exc:
