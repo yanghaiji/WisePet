@@ -193,7 +193,12 @@ AGENT.md                 Agent 开发规约、关键决策记录、验证方式
 
 > 前提：你需有 **Apple Developer 账号**并完成 `Developer ID Application` 证书 + 公证权限
 > （这是 Apple 的硬性要求，CI 无法代替你申请）。拿到账号后，凭据只存在你仓库的 secrets 里，
-> 不会进入源码或日志；`package.py` 的公证步骤只在 `WISEPET_NOTARIZE=1` 且三项 Apple 凭据齐全时才调用 `xcrun`，否则静默跳过。`
+> 不会进入源码或日志；`package.py` 的公证步骤只在 `WISEPET_NOTARIZE=1` 且三项 Apple 凭据齐全时才调用 `xcrun`，否则静默跳过。
+>
+> 改 workflow 时注意：GitHub Actions 的 `if:` **不能引用 `secrets`**（会报
+> `Unrecognized named-value: 'secrets'` 导致整个 workflow 失效），所以「有没有证书」是在
+> shell 里用 `-z` 判断的；`if:` 只用了 `matrix.target`。另外 macOS runner 是 BSD `base64`，
+> 不支持 `--decode`，证书解码走 Python。这些约束由 `tests/unit/test_workflow_expressions.py` 静态护栏锁住。
 
 ## 文档
 

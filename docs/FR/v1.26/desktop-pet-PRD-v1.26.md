@@ -34,6 +34,18 @@
 | R2 | 脚本支持公证：`notarize_dmg()` 走 `xcrun notarytool submit --wait` + `stapler staple` | AC-PUB-2：仅 `WISEPET_NOTARIZE=1` 且三项 Apple 凭据齐全才调用 `xcrun`；凭据走环境变量、不落盘、不打印明文 |
 | R3 | CI 注入签名/公证 secrets，并按需导入 p12 证书到临时钥匙串 | AC-PUB-3：未配 `MACOS_CERTIFICATE` 时导入步骤跳过，自动降级为未签名 dmg |
 | R4 | 未配凭据时行为不变：出未签名 dmg（右键→打开可用），不假装完成 | AC-PUB-4：CI 双平台矩阵仍各自产出、不中断 |
+| R4a | **workflow 必须能被 GitHub 正常解析**：`if:` 不引用 `secrets` context，证书存在性判断放 shell（补登，编号避开 C44 的 R5） | AC-PUB-5：见下方「CI 语法修复」——用户推送时曾报 `Unrecognized named-value: 'secrets'` |
+
+### CI 语法修复（用户推送时报错，补登）
+
+首次推送时 GitHub 报：
+`Invalid workflow file ... (Line: 34, Col: 13): Unrecognized named-value: 'secrets'`。
+根因：证书导入 step 写成 `if: matrix.target == 'macos' && secrets.MACOS_CERTIFICATE != ''`，
+而 GitHub Actions 的 `if:` **不允许引用 `secrets` context**（只允许
+`github/needs/strategy/matrix/job/runner/env/vars/steps/inputs`），整个 workflow 解析失败。
+改为 `if: matrix.target == 'macos'`，证书存在性判断挪进 shell（`-z` 检测 + `exit 0` 跳过）；
+同段把 `base64 --decode`（GNU）换成 Python `base64.b64decode`，因为 macOS runner 自带 BSD
+`base64` 不支持该长选项。新增 7 项纯标准库静态护栏（本机无 actionlint/PyYAML，真解析仍以 GitHub 为准）。
 
 ### 范围外（不假装完成）
 
@@ -118,7 +130,7 @@
 
 | 组 | 覆盖 |
 |---|---|
-| AC-PUB-1~4 | CI 签名公证开关、secrets 缺失降级、双平台产物 |
+| AC-PUB-1~5 | CI 签名公证开关、secrets 缺失降级、双平台产物、workflow 表达式可解析 |
 | AC-FX-1~5 | 7 种绘制、随触发、随机池、配置回落、退场 |
 | AC-OPT-1~6 | 零随机、统一骨架、统一节奏、包络、提前 reveal、三角碎片配色 |
 

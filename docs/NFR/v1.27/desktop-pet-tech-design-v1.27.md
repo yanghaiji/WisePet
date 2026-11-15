@@ -12,7 +12,18 @@
 |---|---|
 | `tools/package.py` | 新增 `sign_dmg(dmg, dry_run)`（对 hdiutil 产物加 `--options runtime` 签名，否则公证必被拒）与 `notarize_dmg(dmg, dry_run)`；macOS 分支改为 `sign_app → dmg_installer → sign_dmg → notarize_dmg` |
 | `tools/package.py` | `notarize_dmg` 三重门控：`WISEPET_NOTARIZE == "1"` 才进、`APPLE_ID/APPLE_APP_PASSWORD/APPLE_TEAM_ID` 齐全才调 `xcrun`、`dry_run` 下只打印说明绝不回显明文密码；凭据全部走 `os.environ`，不落盘 |
-| `.github/workflows/build.yml` | 打包步骤注入 6 个 secrets（`WISEPET_CODESIGN_IDENTITY`/`WISEPET_NOTARIZE`/`APPLE_ID`/`APPLE_APP_PASSWORD`/`APPLE_TEAM_ID`）；新增「导入 macOS 证书」step，仅当 `secrets.MACOS_CERTIFICATE != ''` 且 `matrix.target == 'macos'` 才执行（base64 解码 → 临时 keychain → `security import` → `set-key-partition-list`） |
+| `.github/workflows/build.yml` | 打包步骤注入 6 个 secrets（`WISEPET_CODESIGN_IDENTITY`/`WISEPET_NOTARIZE`/`APPLE_ID`/`APPLE_APP_PASSWORD`/`APPLE_TEAM_ID`）；新增「导入 macOS 证书」step（base64 解码 → 临时 keychain → `security import` → `set-key-partition-list`） |
+
+**CI 语法修复（用户真机推送时报错）**：证书 step 原写成
+`if: matrix.target == 'macos' && secrets.MACOS_CERTIFICATE != ''`，GitHub Actions 的 `if:`
+**不允许引用 `secrets` context**（只允许 `github/needs/strategy/matrix/job/runner/env/vars/steps/inputs`），
+报 `Invalid workflow file ... Unrecognized named-value: 'secrets'`，导致整个 workflow 解析失败。
+改为 `if: matrix.target == 'macos'`，把「有没有证书」挪进 shell 用 `-z "$MACOS_CERTIFICATE"`
+判断并 `exit 0` 优雅跳过。同段另修一个 macOS 专属隐患：runner 自带 BSD `base64` 不支持 GNU 的
+`--decode`，改用 `python -c "base64.b64decode(os.environ['MACOS_CERTIFICATE'])"` 解码。
+新增 `tests/unit/test_workflow_expressions.py`（7 项纯标准库静态护栏）：`if:` 不得出现
+`secrets.`、只允许合法 context 前缀、`${{ }}` 配对、step 缩进一致、证书 step 的 shell 兜底、
+禁用 `base64 --decode`。本机无 actionlint/PyYAML/Ruby，只能做静态校验，真 YAML 解析仍以 GitHub 为准。
 | `tests/unit/test_package_macos.py`（新，5 项） | 双重开关判定、凭据缺失降级、`sign_dmg` 身份门控；`run()` 用 monkeypatch 记录调用，不真正执行 `codesign/xcrun` |
 
 **降级语义**：任一凭据缺失即跳过对应步骤，产出未签名 dmg；CI 双平台矩阵不中断。

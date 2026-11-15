@@ -30,13 +30,20 @@ jobs:
         if: matrix.target == 'windows'
         run: choco install nsis -y --no-progress
       - name: 导入 macOS 签名证书（仅当用户配置了 secret）
-        # 未配置 MACOS_CERTIFICATE 时整步跳过，自动走「未签名 dmg」路径
-        if: matrix.target == 'macos' && secrets.MACOS_CERTIFICATE != ''
+        # GitHub Actions 的 if: 不允许引用 secrets context（只允许
+        # github/needs/strategy/matrix/job/runner/env/vars/steps/inputs）。
+        # 所以「有没有证书」放到 shell 里判断：if: 只用 matrix，绝对安全。
+        if: matrix.target == 'macos'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
-          echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/wisepet-cert.p12
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "未配置 MACOS_CERTIFICATE，跳过证书导入，走未签名 dmg 路径"
+            exit 0
+          fi
+          # macOS 自带的是 BSD base64，不支持 GNU 的 --decode；用 Python 解码最稳
+          python -c "import base64, os; open('/tmp/wisepet-cert.p12','wb').write(base64.b64decode(os.environ['MACOS_CERTIFICATE']))"
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
