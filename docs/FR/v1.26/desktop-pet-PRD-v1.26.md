@@ -134,7 +134,9 @@
 | AC-FX-1~5 | 7 种绘制、随触发、随机池、配置回落、退场 |
 | AC-OPT-1~6 | 零随机、统一骨架、统一节奏、包络、提前 reveal、三角碎片配色 |
 
-- 全量回归 `1350 passed`，覆盖率 `94.37%`（3873/4104，门槛 90）。
+- 全量回归基线 `1350 passed`，覆盖率 `94.37%`（3873/4104，门槛 90）——该数字为上一轮执行结果。
+- **本次 CI 语法修复**新增 `tests/unit/test_workflow_expressions.py` 7 项静态护栏，
+  已单独运行验证 `7 passed`；本次未重新执行全量回归，故上表基线数字未改。
 - 新增/改写测试：`tests/unit/test_package_macos.py`（5）、`tests/ui/test_tech_effects.py`（73，
   其中 21 项逐帧确定性 + 骨架/节奏/包络/reveal）、`tests/unit/test_enter_effect_config.py`、
   `tests/ui/test_main_assembly.py::TestEnterEffectRandom`、`TestEnterEffectFollowsTrigger`。

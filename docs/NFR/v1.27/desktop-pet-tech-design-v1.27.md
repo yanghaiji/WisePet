@@ -116,8 +116,9 @@ _draw_finale(painter, t)                         # 收尾(66%~100%)：光晕 + �
 `constBits()` 内存缓冲比较语义（不同 `QImage` 对象的缓冲地址不可直接比）。
 
 ```
-全量 1350 passed / 0 failures
+全量基线 1350 passed / 0 failures（上一轮执行结果；本次未重跑全量）
 覆盖率 94.37%（3873 / 4104 stmts，门槛 90）
+本次新增 7 项 workflow 护栏单独验证 7 passed
 改动文件 lints 0
 ```
 
