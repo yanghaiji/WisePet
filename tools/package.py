@@ -65,6 +65,13 @@ EXCLUDE_MODULES = (
 MAX_BUNDLE_MB = 160.0
 MAX_BUNDLE_FILES = 800
 
+#: macOS 的 .app 是 framework 目录树（Qt6*.framework 带 Versions/Current
+#: 符号链接、arm64/x86_64 多架构 slice），文件数与体积天然数倍于 Windows
+#: onedir。用 Windows 阈值去卡它会把「dmg 已正常生成」误判为失败，进而让
+#: CI 打包步骤退出 1、上传步骤被跳过（真机 CI 实锤）。护栏仍保留，只是按平台取值。
+MAX_BUNDLE_MB_MACOS = 600.0
+MAX_BUNDLE_FILES_MACOS = 4000
+
 #: 冻结后按文件名修剪的二进制：`--exclude-module` 只挡 Python 模块挡不住
 #: 二进制——被排除模块（Quick/Qml/Pdf 等）的 Qt DLL 仍会以依赖形式被
 #: PyInstaller 收进包（PySide6 6.12 实测多出 ~42MB）。桌宠只用
@@ -463,17 +470,25 @@ def prune_bundle(bundle: Path) -> None:
 
 
 def verify_bundle(bundle: Path, target: str) -> dict:
-    """产物自检：可执行文件、运行期素材、文件数与体积（CI / --verify 共用）。"""
+    """产物自检：可执行文件、运行期素材、文件数与体积（CI / --verify 共用）。
+
+    macOS 的 .app 内含大量 framework 符号链接（Versions/Current 等），
+    `rglob` 会遍历到链接本身，`stat()` 又会跟着链接指向重复计一次体积。
+    这里按「只算真实文件」去重，并按平台取阈值，避免误判健康产物。
+    """
     exe = (bundle / f"{APP}.exe" if target == "windows"
            else bundle / "Contents" / "MacOS" / APP)
     icon = asset_destination(target, bundle) / "pet" / "cat" / "idle" / "01.png"
-    files = [p for p in bundle.rglob("*") if p.is_file()]
+    files = [p for p in bundle.rglob("*") if p.is_file() and not p.is_symlink()]
     size = sum(p.stat().st_size for p in files) / 1048576
+    max_files = MAX_BUNDLE_FILES_MACOS if target == "macos" else MAX_BUNDLE_FILES
+    max_mb = MAX_BUNDLE_MB_MACOS if target == "macos" else MAX_BUNDLE_MB
     report = {"exe": exe.is_file(), "assets": icon.is_file(),
-              "files": len(files), "size_mb": round(size, 2)}
+              "files": len(files), "size_mb": round(size, 2),
+              "max_files": max_files, "max_mb": max_mb}
     report["ok"] = (report["exe"] and report["assets"]
-                    and len(files) <= MAX_BUNDLE_FILES
-                    and size <= MAX_BUNDLE_MB)
+                    and len(files) <= max_files
+                    and size <= max_mb)
     return report
 
 
@@ -562,9 +577,12 @@ def main() -> int:
     if not args.dry_run:
         report = verify_bundle(bundle, target)
         log(f"产物自检：exe={report['exe']} assets={report['assets']} "
-            f"files={report['files']} size={report['size_mb']}MB")
+            f"files={report['files']}/{report['max_files']} "
+            f"size={report['size_mb']}/{report['max_mb']}MB target={target}")
         if not report["ok"]:
-            fail("产物自检失败：缺可执行文件/素材，或文件数与体积超过阈值")
+            fail("产物自检失败：缺可执行文件/素材，或文件数与体积超过阈值"
+                 f"（files {report['files']}/{report['max_files']}，"
+                 f"size {report['size_mb']}/{report['max_mb']}MB）")
         shutil.rmtree(TMP, ignore_errors=True)
     log("产物：")
     for path in artifacts:

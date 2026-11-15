@@ -29,37 +29,24 @@ jobs:
       - name: 安装 NSIS（仅 Windows）
         if: matrix.target == 'windows'
         run: choco install nsis -y --no-progress
-      - name: 导入 macOS 签名证书（仅当用户配置了 secret）
-        # GitHub Actions 的 if: 不允许引用 secrets context（只允许
-        # github/needs/strategy/matrix/job/runner/env/vars/steps/inputs）。
-        # 所以「有没有证书」放到 shell 里判断：if: 只用 matrix，绝对安全。
-        if: matrix.target == 'macos'
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-        run: |
-          if [ -z "$MACOS_CERTIFICATE" ]; then
-            echo "未配置 MACOS_CERTIFICATE，跳过证书导入，走未签名 dmg 路径"
-            exit 0
-          fi
-          # macOS 自带的是 BSD base64，不支持 GNU 的 --decode；用 Python 解码最稳
-          python -c "import base64, os; open('/tmp/wisepet-cert.p12','wb').write(base64.b64decode(os.environ['MACOS_CERTIFICATE']))"
-          security create-keychain -p "" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "" build.keychain
-          security import /tmp/wisepet-cert.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+      # 签名/公证链路暂时停用（用户要求「先不启用密钥」）：CI 不注入任何
+      # secrets、不导入证书，打包走纯路径，产出未签名 dmg。
+      # 代码能力保留在 tools/package.py 的 sign_app/sign_dmg/notarize_dmg，
+      # 以后有 Apple Developer 账号时，按 README「在 GitHub Actions 上出签名+
+      # 公证的 Mac 包」一节把 env 与证书导入步骤加回来即可，无需改脚本。
       - name: 打包
-        # 签名/公证凭据来自仓库 secrets；未配置时各项为空，脚本自动跳过对应步骤。
-        # WISEPET_NOTARIZE 必须是字面量 "1" 才触发公证，避免误提交空凭据。
         env:
           PYTHONIOENCODING: utf-8
-          WISEPET_CODESIGN_IDENTITY: ${{ secrets.WISEPET_CODESIGN_IDENTITY }}
-          WISEPET_NOTARIZE: ${{ secrets.WISEPET_NOTARIZE }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: python tools/package.py --target ${{ matrix.target }}
+      # 打包失败时打印产物清单与自检结果，便于从 Actions 日志直接定位，
+      # 不必再靠「有没有 artifact」反推是哪一步挂了。
+      - name: 打包失败诊断（仅失败时）
+        if: failure()
+        run: |
+          echo "=== dist/ 内容 ==="
+          ls -lah dist/ || true
+          echo "=== 产物自检 ==="
+          python tools/package.py --verify --target ${{ matrix.target }} || true
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:

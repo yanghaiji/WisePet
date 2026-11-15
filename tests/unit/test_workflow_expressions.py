@@ -79,16 +79,21 @@ def should_only_use_allowed_contexts_in_if():
     assert not bad, f"if: 出现不允许的 context：{bad}"
 
 
-def should_guard_certificate_import_in_shell():
-    """证书存在性判断在 shell 里（`-z`），而不是 if:；未配 secret 时优雅跳过。"""
+def should_not_inject_any_secrets_while_signing_disabled():
+    """用户要求「先不启用密钥」：CI 不注入任何 secrets、不导入证书，打包走纯路径。
+
+    这条是临时的产品决策，将来重新启用签名/公证时同步调整本断言即可。
+    """
     build = (WORKFLOW_DIR / "build.yml").read_text(encoding="utf-8")
-    assert 'if: matrix.target == \'macos\'' in build
-    assert '-z "$MACOS_CERTIFICATE"' in build
-    assert "跳过证书导入" in build
+    assert "secrets." not in build
+    assert "MACOS_CERTIFICATE" not in build
+    assert "WISEPET_CODESIGN_IDENTITY" not in build
+    assert "APPLE_ID" not in build
 
 
-def should_decode_certificate_via_python_not_gnu_base64():
-    """macOS 自带 BSD base64 不支持 --decode，必须用 Python 解码。"""
+def should_emit_diagnostics_when_packaging_fails():
+    """打包失败时打印 dist 清单与自检结果，便于从日志直接定位，而非靠 artifact 反推。"""
     build = (WORKFLOW_DIR / "build.yml").read_text(encoding="utf-8")
-    assert "base64 --decode" not in build
-    assert "base64.b64decode" in build
+    assert "if: failure()" in build
+    assert "--verify" in build
+    assert "ls -lah dist/" in build
