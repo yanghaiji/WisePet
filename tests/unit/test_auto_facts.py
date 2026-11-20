@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import time
 
-from WisePet.app.auto_facts import AutoFactExtractor, parse_facts
+from WisePet.app.auto_facts import (
+    AutoFactExtractor, parse_facts, parse_situations,
+)
 from WisePet.app.long_term_memory import LongTermMemory
 from WisePet.infra.product_store import MemoryStore
 
@@ -41,6 +43,42 @@ class TestParseFacts:
         assert parse_facts("[]") == []
         assert parse_facts('[{"key":"x"},{"value":"y"}]') == []
         assert parse_facts('{"key":"x","value":"y"}') == []
+
+    def should_parse_situations_and_keep_facts_backward_compatible(self):
+        raw = ('[{"key":"名字","value":"a"},'
+               '{"kind":"situation","situation":"overtime"},'
+               '{"kind":"situation","situation":"tired"},'
+               '{"kind":"situation","situation":"MadeUp"}]')
+        # 事实解析跳过处境条目、忽略非法类别，仍向后兼容旧输出
+        assert parse_facts(raw) == [("名字", "a")]
+        assert parse_situations(raw) == ["overtime", "tired"]  # 情绪类别进白名单，MadeUp 过滤
+        assert parse_situations("抱歉") == []
+
+    def test_situation_sink_receives_ai_result(self, tmp_path):
+        """AI 识别的处境经旁路送出，不影响事实落盘。"""
+        memory, _ = _memory(tmp_path)
+        gateway = _Gateway('[{"key":"名字","value":"a"},'
+                           '{"kind":"situation","situation":"sick"}]')
+        got = []
+        extractor = AutoFactExtractor(
+            memory, gateway, lambda: object(), lambda: True,
+            situation_sink=got.extend)
+        extractor.observe("user", "我最近身体不太舒服")
+        time.sleep(0.4)
+        assert got and "sick" in got[0]
+        assert any(e["value"] == "a" for e in memory.entries())
+
+    def test_situation_sink_receives_emotion_from_venting(self, tmp_path):
+        """用户吐槽的情绪类别经 AI 识别后由旁路送出，走同一条主动关怀链路。"""
+        memory, _ = _memory(tmp_path)
+        gateway = _Gateway('[{"kind":"situation","situation":"stressed"}]')
+        got = []
+        extractor = AutoFactExtractor(
+            memory, gateway, lambda: object(), lambda: True,
+            situation_sink=got.extend)
+        extractor.observe("user", "压力好大，绷不住了")
+        time.sleep(0.4)
+        assert got and "stressed" in got[0]
 
 
 class TestExtraction:

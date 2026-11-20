@@ -62,6 +62,15 @@ class TestMultiCard:
         assert bubble.current_text() == "AI 摘要新闻"     # 最新一条
         assert bubble.isVisible()
 
+    def should_close_card_via_close_button(self, bubble, qtbot):
+        """每张卡右上角 × 可随时关（视频完成卡不用干等 20 秒）。"""
+        bubble.show_text("视频做好啦", source="ai", anchor=QPoint(400, 300))
+        card = bubble.cards[-1]
+        assert card.close_btn.isVisible()
+        card.close_btn.click()
+        assert card not in bubble.cards
+        assert not bubble.isVisible()          # 唯一一张关掉 → 窗口收起
+
     def should_close_only_clicked_card(self, bubble, qtbot):
         closed = []
         bubble.show_text("第一条", anchor=QPoint(400, 300), with_ack=True,
@@ -129,6 +138,24 @@ def should_replace_with_full_reply_when_stream_done(bubble):
 
     assert "完整回复" in bubble.cards[-1].text_label.text()
     assert bubble.isVisible()
+
+
+def should_show_generated_image_inline_when_stream_done(bubble, tmp_path):
+    """画图产出要在气泡里内联显示，而不是只给一句「图存哪了」。"""
+    from PySide6.QtGui import QColor, QImage
+    img = tmp_path / "cat.png"
+    canvas = QImage(4, 4, QImage.Format.Format_ARGB32)
+    canvas.fill(QColor("#ff0000"))
+    canvas.save(str(img))
+
+    bubble.begin_stream(QPoint(400, 300))
+    bubble.end_stream("画好啦", anchor=QPoint(400, 300), images=(str(img),))
+
+    card = bubble.cards[-1]
+    assert card.image_label.isVisible()
+    assert not card.image_label.pixmap().isNull()
+    assert card.save_btn.isVisible()             # 有图就有「保存图片」入口
+    assert card._image_path == str(img)
 
 
 def should_render_markdown_when_assistant_replies(bubble):

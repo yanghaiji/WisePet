@@ -15,10 +15,13 @@ class ChatHistory:
     def record(self, event: ChatTurnRecordedEvent) -> ChatRecord | None:
         """空白内容不入历史（取消/空回复不该留一条空泡）。"""
         content = str(event.content or "").strip()
-        if not content:
+        images = tuple(getattr(event, "images", ()) or ())
+        videos = tuple(getattr(event, "videos", ()) or ())
+        if not content and not images and not videos:
             return None
         record = ChatRecord(role=event.role, content=content, source=event.source,
-                            ts=event.ts, session_id=event.session_id)
+                            ts=event.ts, session_id=event.session_id,
+                            images=images, videos=videos)
         self._store.append(record)
         return record
 

@@ -44,6 +44,38 @@ def should_append_and_load_in_insertion_order(tmp_path):
     assert loaded[0].session_id == day_key(BASE)
 
 
+def should_persist_generated_image_paths(tmp_path):
+    """画图产出要随记录落盘，重启后历史对话还能看到图片。"""
+    repo = SqliteChatRepository(tmp_path)
+    rec = ChatRecord(role="assistant", content="画好啦", source="ai", ts=BASE,
+                     session_id=day_key(BASE), images=("/tmp/cat.png", "/tmp/dog.png"))
+    repo.append(rec)
+
+    loaded = repo.load(day_key(BASE))
+    assert loaded[0].images == ("/tmp/cat.png", "/tmp/dog.png")
+
+
+def should_find_chat_by_term_variant(tmp_path):
+    """检索词召回：查「周报」能命中「这周要写周报」，比纯子串更宽。"""
+    repo = SqliteChatRepository(tmp_path)
+    repo.append(_record("这周要写周报", BASE, role="user", source="user"))
+    repo.append(_record("今天天气不错", BASE + 60, role="user", source="user"))
+
+    hits = repo.search("周报")
+    assert len(hits) == 1 and "周报" in hits[0].content
+
+
+def should_read_old_rows_without_images_column(tmp_path):
+    """旧库（无 images 列）补齐后，旧记录读出来 images 为空，不崩。"""
+    repo = SqliteChatRepository(tmp_path)
+    repo.append(_record("旧消息", BASE))
+    # 模拟旧库结构：删掉 images 列的值（置默认），读取应回落空元组
+    with sqlite3.connect(repo.path) as conn:
+        conn.execute("UPDATE chat_turns SET images='[]'")
+        conn.commit()
+    assert repo.load(day_key(BASE))[0].images == ()
+
+
 def should_split_by_day_without_truncating(tmp_path):
     repo = SqliteChatRepository(tmp_path)
     for i in range(25):

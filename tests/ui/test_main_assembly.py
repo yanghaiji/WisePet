@@ -15,6 +15,7 @@ from WisePet.domain.chat_record import day_key
 from WisePet.domain.errors import AIGatewayError
 from WisePet.domain.events import (
     ChatErrorEvent,
+    ChatReplyChunkEvent,
     KIND_WATER,
     HelpRequestEvent,
     ReminderDueEvent,
@@ -163,9 +164,11 @@ def should_reply_locally_without_ai_key_when_message_processed(pet_app):
 
     assert pet_app._chat.process_next() is True
 
+    # 就地反馈：气泡入口的回复留在宠物旁气泡，不跳历史窗
     text = pet_app._bubble.current_text()
     assert text and "你" in text               # v1.4 C6：首句先接住用户，而不是自报家门
-    assert "连上" not in text                     # 区别于 AUTH 失败的「我还没连上大脑哦」
+    assert "我还没连上大脑" not in text          # 区别于 AUTH 失败的兜底话术
+    assert not pet_app._chat_window.isVisible()  # 没被强行拉出历史窗
     assert pet_app._streaming is False
     assert pet_app.pet.state is BehaviorState.SPEAKING
     assert pet_app._session.last_role == "assistant"
@@ -176,9 +179,76 @@ def should_use_readable_fallback_when_chat_error(pet_app):
 
     pet_app._bus.publish(ChatErrorEvent(kind=AIGatewayError.NETWORK, detail="dns down"))
 
-    assert pet_app._bubble.current_text() == ChatService.fallback_text(AIGatewayError.NETWORK)
+    fallback = ChatService.fallback_text(AIGatewayError.NETWORK)
+    assert fallback in pet_app._bubble.current_text()   # 气泡入口的错误兜底留在气泡
     assert pet_app._streaming is False
     assert pet_app.pet.state is BehaviorState.SPEAKING
+
+
+def should_announce_video_task_key_points(pet_app, monkeypatch, tmp_path):
+    """视频任务提交/完成要弹提醒，完成时告诉用户文件名和位置。"""
+    from WisePet.domain.events import MediaTaskEvent
+    spoken = []
+    monkeypatch.setattr(pet_app._controller, "speak",
+                        lambda text, **kw: spoken.append(text))
+
+    pet_app._on_media_task(MediaTaskEvent(task_id="v1", status="submitted"))
+    assert any("提交" in s and "几分钟" in s for s in spoken)
+    assert "视频任务已提交" in pet_app._chat_window._history.toHtml()  # 历史窗里也看得见
+
+    video = tmp_path / "generated" / "video-123.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"MP4")
+    pet_app._on_media_task(MediaTaskEvent(task_id="v1", status="done",
+                                          text="完成", path=str(video)))
+    assert any("video-123.mp4" in s and "generated" in s for s in spoken)
+    done_html = pet_app._chat_window._history.toHtml()
+    assert "video-123.mp4" in done_html and "播放" in done_html
+
+
+def should_open_history_and_hide_input_on_history_button(pet_app):
+    """点输入条的「聊天记录」：主动打开历史窗、收起输入条（无自动跳变）。"""
+    pet_app._chat_input.show_near(pet_app._window.window_rect())
+    pet_app._chat_input._history_btn.click()
+    assert pet_app._chat_window.isVisible()
+    assert not pet_app._chat_input.isVisible()
+
+
+def should_keep_reply_in_bubble_without_jumping_to_history(pet_app):
+    """气泡入口发消息：回复就地留在气泡，不自动弹出历史窗、不收起输入条。"""
+    pet_app.send_message("画一只猫")           # 默认 input 通道
+
+    assert not pet_app._chat_window.isVisible()  # 绝不自动跳到历史窗
+    assert pet_app._bubble.isVisible()           # 回复在宠物旁气泡就地显示
+    assert not pet_app._chat_window.is_streaming_reply  # 历史窗没有被抢占流式
+
+
+def should_route_replies_to_their_own_entry(pet_app, monkeypatch):
+    """就地反馈：气泡入口→气泡，历史窗入口→历史窗，各回各家不串台。"""
+    history_calls = []
+    bubble_calls = []
+    monkeypatch.setattr(pet_app._chat_window, "append_stream_piece",
+                        lambda d: history_calls.append(("piece", d)))
+    monkeypatch.setattr(pet_app._chat_window, "end_stream_reply",
+                        lambda *a, **kw: history_calls.append(("end", a)))
+    monkeypatch.setattr(pet_app._bubble, "append_chunk",
+                        lambda d: bubble_calls.append(d))
+    monkeypatch.setattr(pet_app._bubble, "end_stream",
+                        lambda *a, **kw: bubble_calls.append("end"))
+    monkeypatch.setattr(pet_app._tts, "announce", lambda *_a, **_kw: None)
+
+    # input 通道 → 气泡
+    pet_app._bus.publish(ChatReplyChunkEvent(text_delta="你", channel="input"))
+    pet_app._bus.publish(ChatReplyChunkEvent(text_delta="", done=True,
+                                             reply="你好", channel="input"))
+    # history 通道 → 历史窗
+    pet_app._bus.publish(ChatReplyChunkEvent(text_delta="好", channel="history"))
+    pet_app._bus.publish(ChatReplyChunkEvent(text_delta="", done=True,
+                                             reply="你也好", channel="history"))
+
+    assert bubble_calls == ["你", "end"]              # 气泡只收到 input 通道
+    assert ("piece", "好") in history_calls           # 历史窗只收到 history 通道
+    assert ("piece", "你") not in history_calls       # 不串台
 
 
 def should_fill_persona_placeholders_when_system_prompt_built(pet_app):
@@ -362,7 +432,7 @@ class TestChatSessionLifecycle:
         pet_app._bus.publish(ChatErrorEvent(kind=AIGatewayError.TIMEOUT, detail="slow"))
 
         assert "出错了" in pet_app._chat_window.status_text
-        assert AIGatewayError.TIMEOUT in pet_app._chat_window.status_text
+        assert "slow" in pet_app._chat_window.status_text   # 显示错误原因而非类别
 
     def should_restore_today_history_when_restarted(self, qapp, tmp_path, assets_dir, qtbot):
         first = _build(qapp, tmp_path, assets_dir)
@@ -485,6 +555,79 @@ def should_log_chat_brain_ai_when_key_saved(pet_app, caplog):
 
     assert "chat brain=ai" in caplog.text
     assert "model=glm-4-flash" in caplog.text
+
+
+# ---------- 切换模型必须真正生效（家庭共享不吞掉 model） ----------
+
+def should_use_switched_model_even_with_family_share(pet_app, tmp_path):
+    """真机 bug：配了两个模型，切换后调用的还是旧模型——共享 Key 把 model 一起覆盖了。"""
+    from WisePet.domain.config_model import AIProfile
+
+    shared = SharedAIStore(tmp_path)          # 家庭共享里是旧模型和旧 Key
+    shared.save(replace(pet_app._config.ai, api_key="sk-shared",
+                        model="old-shared-model"))
+    pet_app._shared_ai = shared
+
+    cfg = pet_app._config
+    new_profile = AIProfile(name="新模型", base_url=cfg.ai.base_url,
+                            api_key="sk-new", model="brand-new-model")
+    cfg = replace(cfg, ai_profiles=[AIProfile.from_ai(cfg.ai), new_profile],
+                  assistant=replace(cfg.assistant, use_family_ai=True))
+    pet_app.apply_config(cfg)
+
+    pet_app._apply_model_profile("新模型")
+
+    # Key / 端点走共享，但 model 必须是刚选的那个
+    effective = pet_app._effective_ai()
+    assert effective.api_key == "sk-shared"
+    assert effective.model == "brand-new-model"
+    assert pet_app._active_profile_name() == "新模型"
+
+
+def should_switch_model_without_family_share(pet_app):
+    """没开家庭共享时切模型：三件套整体切过去，下拉也跟着更新。"""
+    from WisePet.domain.config_model import AIProfile
+
+    cfg = pet_app._config
+    cfg = replace(cfg, assistant=replace(cfg.assistant, use_family_ai=False),
+                  ai_profiles=[AIProfile.from_ai(cfg.ai),
+                               AIProfile(name="视觉", base_url="https://v/v1",
+                                         api_key="k2", model="vision-pro")])
+    pet_app.apply_config(cfg)
+
+    pet_app._apply_model_profile("视觉")
+
+    effective = pet_app._effective_ai()
+    assert effective.model == "vision-pro"
+    assert effective.api_key == "k2"
+    assert effective.base_url == "https://v/v1"
+    assert pet_app._active_profile_name() == "视觉"
+
+
+def should_use_local_config_for_manager_even_with_stale_shared_snapshot(pet_app, tmp_path):
+    """真机 bug：管理员本地已切到 agnes，却因旧共享快照仍打去 bigmodel（URL+Key 都错）。"""
+    shared = SharedAIStore(tmp_path)          # 旧快照：bigmodel + 旧 Key
+    shared.save(replace(pet_app._config.ai, base_url="https://open.bigmodel.cn/api/paas/v4",
+                        api_key="sk-old", model="glm-4-flash"))
+    pet_app._shared_ai = shared
+
+    cfg = pet_app._config
+    new_ai = replace(cfg.ai, base_url="https://apihub.agnes-ai.cn/v1",
+                     api_key="sk-new", model="agnes-3.0-flash")
+    # 管理员：share + use 都勾（用户实际配置），本地已切到 agnes
+    pet_app.apply_config(replace(cfg, ai=new_ai,
+                                 assistant=replace(cfg.assistant,
+                                                   share_family_ai=True,
+                                                   use_family_ai=True)))
+
+    effective = pet_app._effective_ai()
+    assert effective.base_url == "https://apihub.agnes-ai.cn/v1"
+    assert effective.api_key == "sk-new"
+    assert effective.model == "agnes-3.0-flash"
+    # 且共享文件被同步成管理员的最新配置，家人以后跟上
+    synced = shared.load()
+    assert synced.base_url == "https://apihub.agnes-ai.cn/v1"
+    assert synced.model == "agnes-3.0-flash"
 
 
 class TestFloorAndMotionTimer:

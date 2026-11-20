@@ -1,7 +1,9 @@
 """OpenAI 兼容流式客户端：POST {base_url}/chat/completions（PRD M4）。"""
 from __future__ import annotations
 
+import base64
 import json
+import time
 import logging
 from typing import Iterator
 
@@ -67,7 +69,7 @@ def probe(cfg: AIConfig) -> None:
         with httpx.Client(timeout=PROBE_TIMEOUT_S) as client:
             resp = client.post(cfg.chat_endpoint, json=payload,
                               headers={"Authorization": f"Bearer {cfg.api_key}"})
-        _raise_status_code(resp.status_code)
+        _raise_status_code(resp.status_code, resp.text)
         # 只看状态码会「测试连接成功但聊天没回复」：网关可以把错误包在 200 里
         hint = _body_error(resp.text)
         if hint:
@@ -85,14 +87,37 @@ def probe(cfg: AIConfig) -> None:
         raise AIGatewayError(AIGatewayError.NETWORK, str(exc)) from exc
 
 
-def _raise_status_code(status_code: int) -> None:
-    """状态码 → 错误分类（与 OpenAICompatClient._raise_for_status 同一语义）。"""
+def _status_detail(status_code: int, body: str = "") -> str:
+    """HTTP 状态 + 响应体里的错误说明（400 的真实原因几乎都在 body 里）。
+
+    之前只写「HTTP 400」，用户和日志都看不到是模型名错、参数不支持还是别的，
+    排查全靠猜。这里把网关返回的错误消息带出来（截断，不整块输出响应体）。
+    """
+    hint = _body_error(body)
+    base = f"HTTP {status_code}"
+    return f"{base}: {hint}" if hint else base
+
+
+def _raise_status_code(status_code: int, body: str = "") -> None:
+    """状态码 → 错误分类（与 OpenAICompatClient._raise_for_status 同一语义）。
+
+    400/422：消息体若明确说不支持 tools 等协议问题，归 PROTOCOL 让上层降级；
+    其余保持 SERVER，但 detail 一律带上响应体错误说明。
+    """
+    detail = _status_detail(status_code, body)
     if status_code in (401, 403):
-        raise AIGatewayError(AIGatewayError.AUTH, f"HTTP {status_code}")
+        raise AIGatewayError(AIGatewayError.AUTH, detail)
     if status_code == 429:
         raise AIGatewayError(AIGatewayError.RATE, "HTTP 429 限流")
+    if status_code in (400, 422):
+        # 模型名拼错/参数非法也是 400，但那不是「网关不支持 tools」；
+        # 仅当错误体明确提到 tools/function 才归 PROTOCOL 触发降级。
+        lowered = detail.lower()
+        if any(word in lowered for word in ("tool", "function_call", "function call")):
+            raise AIGatewayError(AIGatewayError.PROTOCOL, detail)
+        raise AIGatewayError(AIGatewayError.SERVER, detail)
     if status_code >= 500 or not 200 <= status_code < 300:
-        raise AIGatewayError(AIGatewayError.SERVER, f"HTTP {status_code}")
+        raise AIGatewayError(AIGatewayError.SERVER, detail)
 
 
 class OpenAICompatClient:
@@ -104,7 +129,8 @@ class OpenAICompatClient:
     2xx 但回读不出内容（错误包在 200 里 / 非 SSE / 空流）→ protocol。
     """
 
-    def stream_chat(self, messages: list[dict], cfg: AIConfig) -> Iterator[str]:
+    def stream_chat(self, messages: list[dict], cfg: AIConfig,
+                    on_reasoning=None) -> Iterator[str]:
         if not cfg.configured:
             raise AIGatewayError(AIGatewayError.AUTH, "api_key 未配置")
         payload = {
@@ -132,11 +158,16 @@ class OpenAICompatClient:
                             AIGatewayError.PROTOCOL,
                             _body_error(body) or f"响应不是流式（content-type={content_type}）")
                     emitted = 0
-                    for chunk in self._iter_sse(resp):
+                    seen: list[str] = []
+                    def _collect_reasoning(part: str) -> None:
+                        seen.append(part)
+                        if on_reasoning is not None:
+                            on_reasoning(part)
+                    for chunk in self._iter_sse(resp, on_reasoning=_collect_reasoning):
                         emitted += 1
                         yield chunk
-                    if emitted == 0:
-                        # 一段内容都没解析出来 = 用户看到的是“没回复”，必须当成错误报出去
+                    if emitted == 0 and not seen:
+                        # 正文和思考都没解析出来 = 用户看到的是“没回复”，必须报错
                         raise AIGatewayError(
                             AIGatewayError.PROTOCOL,
                             "流式响应里没有解析到文本内容（缺少 choices[0].delta.content）")
@@ -153,7 +184,8 @@ class OpenAICompatClient:
         return content
 
     def chat_with_tools(self, messages: list[dict], cfg: AIConfig,
-                        tools: list[dict]) -> tuple[str, list[dict]]:
+                        tools: list[dict],
+                        on_reasoning=None) -> tuple[str, list[dict]]:
         """非流式带工具定义（OpenAI tools 协议）：返回 (content, tool_calls)。
 
         content 可为空（模型只请求工具）；tool_calls 已把 arguments 从 JSON
@@ -175,15 +207,25 @@ class OpenAICompatClient:
         try:
             with httpx.Client(timeout=cfg.timeout_s) as client:
                 resp = client.post(cfg.chat_endpoint, json=payload, headers=headers)
-            _raise_status_code(resp.status_code)
+            _raise_status_code(resp.status_code, resp.text)
             obj = json.loads(resp.text)
             if not isinstance(obj, dict):
                 raise AIGatewayError(AIGatewayError.PROTOCOL, "响应不是 JSON 对象")
             hint = _dict_error(obj)
             if hint:
-                raise AIGatewayError(AIGatewayError.PROTOCOL, hint)
+                # 网关把「不支持 tools」包在 200 里时也要触发上层降级
+                kind = (AIGatewayError.PROTOCOL
+                        if ("tool" in hint.lower() or "function_call" in hint.lower())
+                        else AIGatewayError.SERVER)
+                raise AIGatewayError(kind, hint)
             choices = obj.get("choices") or []
             message = (choices[0].get("message") or {}) if choices else {}
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+            if reasoning and on_reasoning is not None:
+                try:
+                    on_reasoning(str(reasoning))
+                except Exception:  # noqa: BLE001 - 展示增强不崩调用
+                    logger.debug("reasoning callback failed", exc_info=True)
             content = str(message.get("content") or "")
             calls: list[dict] = []
             for index, call in enumerate(message.get("tool_calls") or []):
@@ -216,7 +258,8 @@ class OpenAICompatClient:
 
     def chat_with_tools_stream(self, messages: list[dict], cfg: AIConfig,
                                tools: list[dict],
-                               on_content=None) -> tuple[str, list[dict]]:
+                               on_content=None,
+                               on_reasoning=None) -> tuple[str, list[dict]]:
         """流式带工具定义：content 增量实时回调 on_content(delta)，返回全文与工具调用。
 
         agent 循环的最后一轮（模型不再请求工具）通过回调拿到逐字增量，
@@ -274,6 +317,12 @@ class OpenAICompatClient:
                         if not choices:
                             continue
                         delta = choices[0].get("delta") or {}
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        if reasoning and on_reasoning is not None:
+                            try:
+                                on_reasoning(str(reasoning))
+                            except Exception:  # noqa: BLE001 - 展示增强不崩流
+                                logger.debug("reasoning callback failed", exc_info=True)
                         text = delta.get("content")
                         if text:
                             content_parts.append(text)
@@ -321,6 +370,157 @@ class OpenAICompatClient:
                 "流式响应里既没有 content 也没有 tool_calls")
         return content, calls
 
+    def generate_image(self, prompt: str, cfg: AIConfig,
+                       size: str = "1024x1024") -> tuple[bytes, str]:
+        """OpenAI 兼容图像生成：POST {base_url}/images/generations。
+
+        兼容两种返回：data[0].b64_json（首选，免二次请求）或 data[0].url
+        （再 GET 拿字节）。返回 (图片字节, 媒体类型)；失败抛 AIGatewayError。
+        图像生成通常比对话慢，这里放宽超时到 max(timeout_s, 120)。
+        """
+        if not cfg.configured:
+            raise AIGatewayError(AIGatewayError.AUTH, "api_key 未配置")
+        payload = {"model": cfg.model, "prompt": str(prompt or ""),
+                   "n": 1, "size": size, "response_format": "b64_json"}
+        headers = {"Authorization": f"Bearer {cfg.api_key}"}
+        timeout = max(float(cfg.timeout_s), 120.0)
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(cfg.image_endpoint, json=payload, headers=headers)
+            _raise_status_code(resp.status_code, resp.text)
+            obj = json.loads(resp.text)
+            if not isinstance(obj, dict):
+                raise AIGatewayError(AIGatewayError.PROTOCOL, "图像响应不是 JSON 对象")
+            hint = _dict_error(obj)
+            if hint:
+                raise AIGatewayError(AIGatewayError.SERVER, hint)
+            data = obj.get("data") or []
+            if not isinstance(data, list) or not data:
+                raise AIGatewayError(AIGatewayError.PROTOCOL, "图像响应里没有 data")
+            first = data[0] if isinstance(data[0], dict) else {}
+            b64 = first.get("b64_json")
+            if isinstance(b64, str) and b64.strip():
+                try:
+                    return base64.b64decode(b64), "image/png"
+                except Exception as exc:  # noqa: BLE001 - 坏 base64 归协议错误
+                    raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                         f"图像 b64_json 解码失败：{exc}") from exc
+            url = str(first.get("url") or "")
+            if not url:
+                raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                     "图像响应既没有 b64_json 也没有 url")
+            # 网关只给了 URL：再 GET 一次拿字节（不落地远程引用，隐私口径）
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                img = client.get(url)
+            _raise_status_code(img.status_code, img.text[:200] if img.content else "")
+            media = (img.headers.get("content-type") or "image/png").split(";", 1)[0]
+            return img.content, media
+        except AIGatewayError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise AIGatewayError(AIGatewayError.PROTOCOL, f"图像响应不是 JSON：{exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise AIGatewayError(AIGatewayError.TIMEOUT, str(exc) or exc.__class__.__name__) from exc
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            raise AIGatewayError(AIGatewayError.NETWORK, str(exc)) from exc
+
+    def generate_video(self, prompt: str, cfg: AIConfig,
+                       progress=None) -> tuple[bytes, str]:
+        """异步视频生成：POST /videos 建任务 → 轮询 /agnesapi → 下载成片。
+
+        Agnes Video 走 OpenAI Videos 兼容协议但状态查询在 host 根目录；不同网关
+        端点可能略有差异，这里对返回字段做宽容解析（id/task_id/video_id 都认）。
+        progress(text) 把排队/生成进度送到 UI；失败抛 AIGatewayError。
+        """
+        if not cfg.configured:
+            raise AIGatewayError(AIGatewayError.AUTH, "api_key 未配置")
+        payload = {"model": cfg.model, "prompt": str(prompt or ""),
+                   "mode": "text", "seconds": "5", "size": "720P",
+                   "aspect_ratio": "16:9", "n": 1}
+        headers = {"Authorization": f"Bearer {cfg.api_key}",
+                   "Content-Type": "application/json"}
+        timeout = max(float(cfg.timeout_s), 60.0)
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(cfg.video_endpoint, json=payload, headers=headers)
+            _raise_status_code(resp.status_code, resp.text)
+            obj = json.loads(resp.text)
+            if not isinstance(obj, dict):
+                raise AIGatewayError(AIGatewayError.PROTOCOL, "视频响应不是 JSON 对象")
+            hint = _dict_error(obj)
+            if hint:
+                raise AIGatewayError(AIGatewayError.SERVER, hint)
+            video_id = str(obj.get("video_id") or obj.get("id")
+                           or obj.get("task_id") or "").strip()
+            if not video_id:
+                raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                     "视频响应里没有 video_id/task_id")
+
+            # 轮询：3 秒一次（2 秒太频繁，国内网关实测第 2 次就 429），最多 5 分钟。
+            # 429 不是任务失败，只是查得太快——退避后重试，任务仍在服务端跑。
+            deadline = time.monotonic() + 300.0
+            status_url = cfg.video_status_endpoint
+            if progress:
+                progress("视频任务已提交，排队中…")
+            backoff = 3.0
+            while time.monotonic() < deadline:
+                time.sleep(backoff)
+                with httpx.Client(timeout=timeout) as client:
+                    poll = client.get(
+                        status_url,
+                        params={"video_id": video_id, "model_name": cfg.model},
+                        headers={"Authorization": f"Bearer {cfg.api_key}"})
+                if poll.status_code == 429:
+                    # 尊重 Retry-After，否则指数退避（3→6→12→24，封顶 30 秒）
+                    retry_after = poll.headers.get("retry-after", "")
+                    try:
+                        wait = float(retry_after) if retry_after else backoff
+                    except ValueError:
+                        wait = backoff
+                    backoff = min(30.0, max(3.0, wait, backoff * 2))
+                    if progress:
+                        progress(f"查进度时被限流，{int(backoff)} 秒后再看…")
+                    continue
+                # 成功查到状态，恢复正常间隔
+                backoff = 3.0
+                _raise_status_code(poll.status_code, poll.text)
+                state = json.loads(poll.text)
+                if not isinstance(state, dict):
+                    raise AIGatewayError(AIGatewayError.PROTOCOL, "视频状态响应不是 JSON 对象")
+                status = str(state.get("status") or "").lower()
+                pct = state.get("progress")
+                if status == "completed":
+                    url = str(state.get("url") or "")
+                    if not url:
+                        raise AIGatewayError(AIGatewayError.PROTOCOL,
+                                             "视频完成但响应里没有 url")
+                    if progress:
+                        progress("视频生成完成，下载中…")
+                    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                        movie = client.get(url)
+                    _raise_status_code(movie.status_code,
+                                       movie.text[:200] if movie.content else "")
+                    media = (movie.headers.get("content-type") or "video/mp4").split(";", 1)[0]
+                    return movie.content, media
+                if status == "failed":
+                    err = state.get("error") or {}
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    raise AIGatewayError(AIGatewayError.SERVER,
+                                         f"视频生成失败：{msg or '未知原因'}")
+                if progress:
+                    detail = f" {int(pct)}%" if isinstance(pct, (int, float)) else ""
+                    label = "生成中" if status in ("in_progress", "processing") else "排队中"
+                    progress(f"视频{label}{detail}…")
+            raise AIGatewayError(AIGatewayError.TIMEOUT, "视频生成超过 5 分钟未完成")
+        except AIGatewayError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise AIGatewayError(AIGatewayError.PROTOCOL, f"视频响应不是 JSON：{exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise AIGatewayError(AIGatewayError.TIMEOUT, str(exc) or exc.__class__.__name__) from exc
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            raise AIGatewayError(AIGatewayError.NETWORK, str(exc)) from exc
+
     def embeddings(self, texts: list[str], cfg: AIConfig) -> list[list[float]]:
         """OpenAI 兼容 embeddings 批量调用：返回与 texts 等长的向量列表。
 
@@ -338,7 +538,7 @@ class OpenAICompatClient:
             with httpx.Client(timeout=cfg.timeout_s) as client:
                 resp = client.post(cfg.embedding_endpoint, json=payload,
                                    headers=headers)
-            _raise_status_code(resp.status_code)
+            _raise_status_code(resp.status_code, resp.text)
             obj = json.loads(resp.text)
             if not isinstance(obj, dict):
                 raise AIGatewayError(AIGatewayError.PROTOCOL, "响应不是 JSON 对象")
@@ -368,11 +568,22 @@ class OpenAICompatClient:
 
     @staticmethod
     def _raise_for_status(resp: httpx.Response) -> None:
-        _raise_status_code(resp.status_code)
+        # 流式响应在报错时读一次 body 拿错误说明；成功时不读，避免破坏 SSE 流。
+        body = ""
+        if resp.status_code < 200 or resp.status_code >= 300:
+            try:
+                body = resp.read().decode("utf-8", "replace")
+            except httpx.HTTPError:
+                body = ""
+        _raise_status_code(resp.status_code, body)
 
     @staticmethod
-    def _iter_sse(resp: httpx.Response) -> Iterator[str]:
-        """解析 SSE 流，逐段 yield delta.content；体内带错误字段时抛 PROTOCOL。"""
+    def _iter_sse(resp: httpx.Response, on_reasoning=None) -> Iterator[str]:
+        """解析 SSE 流，逐段 yield delta.content；体内带错误字段时抛 PROTOCOL。
+
+        推理模型（如 agnes-3.0-flash）会在 delta.reasoning_content 里返回思考过程。
+        有 on_reasoning 回调就把思考段送出去（不混进正文），没有则忽略——完全向后兼容。
+        """
         for line in resp.iter_lines():
             line = (line or "").strip()
             if not line.startswith(_DATA_PREFIX):
@@ -395,6 +606,14 @@ class OpenAICompatClient:
             choices = obj.get("choices") or []
             if not choices:
                 continue
-            content = (choices[0].get("delta") or {}).get("content")
+            delta = choices[0].get("delta") or {}
+            # 思考过程：与正文分开送，不混进给用户的回复
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning and on_reasoning is not None:
+                try:
+                    on_reasoning(str(reasoning))
+                except Exception:  # noqa: BLE001 - 展示是增强，别让回调搞崩流
+                    logger.debug("reasoning callback failed", exc_info=True)
+            content = delta.get("content")
             if content:
                 yield content

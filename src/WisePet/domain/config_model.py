@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
-from .ports import AIConfig
+from .ports import PURPOSE_CHAT, PURPOSES, AIConfig
 from .vitals import DecayRules
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -23,10 +23,17 @@ def normalize_skin(raw) -> str:
     return skin if skin in PET_SKINS else DEFAULT_SKIN
 
 
+def normalize_purpose(raw) -> str:
+    """模型用途归一：非法/空值回落 chat（未知用途当作对话，保证旧配置可用）。"""
+    value = str(raw or "").strip().lower()
+    return value if value in PURPOSES else PURPOSE_CHAT
+
+
 @dataclass
 class PersonaConfig:
     name: str = "小墨"
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    anchor_enabled: bool = True        # 人格一致性锚（换模型不跑偏）
 
 
 @dataclass
@@ -37,12 +44,14 @@ class AIProfile:
     api_key: str = ""
     model: str = "gpt-4o-mini"
     embedding_model: str = ""   # 语义检索用的 embedding 模型（留空禁用）
+    purpose: str = PURPOSE_CHAT  # chat=对话 / image=画图 / video=视频
 
     @classmethod
     def from_ai(cls, ai) -> "AIProfile":
         """把当前生效的 AIConfig 快照成一个方案（旧配置升级入口）。"""
         return cls(name="默认", base_url=ai.base_url, api_key=ai.api_key,
-                   model=ai.model, embedding_model=ai.embedding_model)
+                   model=ai.model, embedding_model=ai.embedding_model,
+                   purpose=getattr(ai, "purpose", PURPOSE_CHAT))
 
 
 @dataclass
@@ -197,6 +206,9 @@ class SystemSettings:
     log_max_mb: int = 10             # 单文件上限，MiB
     log_retention_days: int = 3      # 滚动备份保留天数
     log_split_by_level: bool = True  # 是否另存 WARNING+ 错误档
+    auto_check_update: bool = False  # 启动时后台检查更新（默认关）
+    update_repo: str = ""            # GitHub 仓库 owner/repo（空=不检查）
+    data_dir: str = ""               # 自定义数据根目录（回显用；实际定位靠指针文件）
 
 
 @dataclass
@@ -228,6 +240,7 @@ class CompanionSettings:
     reunion_min_hours: float = 20.0      # 超过这么久才算「久别」
     recall_lookback_days: int = 14       # 惦记回看窗口（天）
     max_recalls: int = 3                 # 同时惦记的条数上限（清单化）
+    situation_enabled: bool = True       # 近期处境体贴（加班/备考/生病…只认明说的）
 
 
 @dataclass
@@ -252,6 +265,18 @@ class LocationSettings:
     """
     enabled: bool = True
     consent: str = "ask"
+
+
+@dataclass
+class WeatherSettings:
+    """主动天气播报：默认关闭，开了才联网（国内天气源免 Key）。
+
+    像喝水/久坐一样按「每隔 N 分钟」提醒，比固定时刻更直观；天气变化慢，
+    默认 3 小时一次。完全属于「有更好」的增强——关闭时一行网络请求都不发。
+    """
+    enabled: bool = False
+    interval_min: float = 180.0        # 每隔多少分钟播报一次（下限见解析处 30）
+    bad_weather_alert: bool = True     # 坏天气（雨雪）额外提醒一次
 
 
 @dataclass
@@ -310,6 +335,7 @@ class AppConfig:
     assistant: AssistantSettings = field(default_factory=AssistantSettings)
     web_search: WebSearchSettings = field(default_factory=WebSearchSettings)
     location: LocationSettings = field(default_factory=LocationSettings)
+    weather: WeatherSettings = field(default_factory=WeatherSettings)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -329,12 +355,15 @@ class AppConfig:
             temperature=_num(ai_d.get("temperature"), defaults.ai.temperature),
             timeout_s=_num(ai_d.get("timeout_s"), defaults.ai.timeout_s),
             embedding_model=str(ai_d.get("embedding_model") or ""),
+            purpose=normalize_purpose(ai_d.get("purpose")),
         )
         profiles = _parse_profiles(data.get("ai_profiles"), ai)
         p_d = data.get("persona") or {}
         persona = PersonaConfig(
             name=str(p_d.get("name") or defaults.persona.name),
             system_prompt=str(p_d.get("system_prompt") or defaults.persona.system_prompt),
+            anchor_enabled=_bool(p_d.get("anchor_enabled"),
+                                 defaults.persona.anchor_enabled),
         )
         pet_d = data.get("pet") or {}
         pet = PetParams(
@@ -494,6 +523,10 @@ class AppConfig:
                                           defaults.system.log_retention_days, 1, 30),
             log_split_by_level=_bool(s_d.get("log_split_by_level"),
                                      defaults.system.log_split_by_level),
+            auto_check_update=_bool(s_d.get("auto_check_update"),
+                                    defaults.system.auto_check_update),
+            update_repo=str(s_d.get("update_repo") or "")[:100],
+            data_dir=str(s_d.get("data_dir") or "")[:500],
         )
         c_d = data.get("companion") or {}
         companion = CompanionSettings(
@@ -513,6 +546,8 @@ class AppConfig:
                 defaults.companion.recall_lookback_days, 1, 90)),
             max_recalls=int(_int_clamp(c_d.get("max_recalls"),
                                        defaults.companion.max_recalls, 1, 10)),
+            situation_enabled=_bool(c_d.get("situation_enabled"),
+                                    defaults.companion.situation_enabled),
         )
         a2_d = data.get("assistant") or {}
         assistant = AssistantSettings(
@@ -557,13 +592,26 @@ class AppConfig:
             consent=_choice(l_d.get("consent"), defaults.location.consent,
                             ("ask", "granted", "denied")),
         )
+        wea_d = data.get("weather") or {}
+        # 兼容旧键：固定时刻（report_hour + report_minute）升级为间隔模式后，
+        # 折算成「每 24 小时一次」，避免用户配置在升级后完全失效。
+        legacy_fixed = wea_d.get("report_hour") is not None \
+            or wea_d.get("daily_report_hour") is not None
+        default_interval = (24 * 60.0) if legacy_fixed else defaults.weather.interval_min
+        weather = WeatherSettings(
+            enabled=_bool(wea_d.get("enabled"), defaults.weather.enabled),
+            interval_min=max(30.0, _num(wea_d.get("interval_min"),
+                                        default_interval)),
+            bad_weather_alert=_bool(wea_d.get("bad_weather_alert"),
+                                    defaults.weather.bad_weather_alert),
+        )
         return cls(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                    vitals=vitals, reminders=reminders, news=news, cheer=cheer,
                    bubble=bubble, chat=chat, focus=focus, dnd=dnd,
                    tts=tts, notification=notification, weekly=weekly, growth=growth,
                    quiet=quiet, behavior=behavior, memory=memory, actions=actions,
                    system=system, companion=companion, assistant=assistant,
-                   web_search=web_search, location=location)
+                   web_search=web_search, location=location, weather=weather)
 
 
 def _parse_profiles(raw, ai: AIConfig) -> list:
@@ -573,14 +621,15 @@ def _parse_profiles(raw, ai: AIConfig) -> list:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
-        base_url = str(item.get("base_url") or "").strip()
-        if not name or not base_url:
+        if not name:
             continue
+        base_url = str(item.get("base_url") or "").strip() or AIProfile.base_url
         profiles.append(AIProfile(
             name=name, base_url=base_url,
             api_key=str(item.get("api_key") or ""),
             model=str(item.get("model") or ai.model),
-            embedding_model=str(item.get("embedding_model") or "")))
+            embedding_model=str(item.get("embedding_model") or ""),
+            purpose=normalize_purpose(item.get("purpose"))))
     if not profiles:
         profiles = [AIProfile.from_ai(ai)]
     # 当前生效的 ai 必须在方案列表里有一席：缺失时把当前配置补录进去

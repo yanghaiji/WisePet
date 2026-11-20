@@ -40,6 +40,20 @@ class TestMarkdownRendering:
         html = _bubble_html(_record("assistant", "```py\nprint(1)\n```", "ai"))
         assert "<pre" in html and "print(1)" in html
 
+    def should_inline_generated_image_for_assistant_record(self, tmp_path):
+        """画图产出在历史对话里内联显示（本机文件，不走远程图的降级口径）。"""
+        from PySide6.QtGui import QColor, QImage
+        img = tmp_path / "cat.png"
+        canvas = QImage(4, 4, QImage.Format.Format_ARGB32)
+        canvas.fill(QColor("#ff0000"))
+        canvas.save(str(img))
+        rec = ChatRecord(role="assistant", content="画好啦", source="ai",
+                         images=(str(img),))
+        html = _bubble_html(rec, ("i1",))
+        assert "<img" in html and "file:///" in html and "cat.png" in html
+        assert "wisepet-save:i1" in html and "保存图片" in html
+        assert str(img) not in html.split("wisepet-save:")[-1]  # href 里不放原始路径
+
 
 @pytest.fixture
 def chat_window(qtbot, fake_screen):
@@ -48,6 +62,70 @@ def chat_window(qtbot, fake_screen):
                         records_provider=lambda _day: [_record("user", "昨天的问候", "user")])
     qtbot.addWidget(widget)
     return widget
+
+
+class TestInlineStreaming:
+    """历史窗直接聊：回复逐字流式上屏，不弹桌面气泡（由 main 按 channel 分发）。"""
+
+    def should_stream_then_finalize_in_window(self, chat_window):
+        chat_window.load_history([])            # 空历史，避免 fixture 的旧记录干扰
+        chat_window.begin_stream_reply()
+        assert chat_window.is_streaming_reply
+
+        chat_window.append_stream_piece("你好")
+        chat_window.append_stream_piece("呀～")
+        html1 = chat_window._history.toHtml()
+        assert "你好呀～" in html1              # 逐字累加可见
+
+        chat_window.end_stream_reply("你好呀～")
+        assert not chat_window.is_streaming_reply
+        assert "你好呀～" in chat_window._history.toHtml()
+        assert chat_window._count == 1           # 只算一条，不重复
+
+    def should_save_image_by_key_when_link_clicked(self, chat_window, tmp_path, monkeypatch):
+        """保存链接只带 key，点击要能查回真实路径并触发另存。"""
+        from PySide6.QtCore import QUrl
+        from WisePet.ui import image_io
+
+        img = tmp_path / "狗.png"          # 故意用中文名 + Windows 路径字符
+        img.write_bytes(b"PNGDATA")
+        key = chat_window._register_images(
+            ChatRecord(role="assistant", content="", images=(str(img),)))[0]
+
+        got = {}
+        monkeypatch.setattr(image_io, "save_image_copy",
+                            lambda p, *a, **k: got.setdefault("path", p) or "saved")
+        chat_window._on_anchor_clicked(QUrl(f"wisepet-save:{key}"))
+
+        assert got["path"] == str(img)
+
+    def should_show_reasoning_above_content(self, chat_window):
+        """推理模型的思考内容要显示在正文上方（浅色块），与回复区分。"""
+        chat_window.load_history([])
+        chat_window.begin_stream_reply()
+        chat_window.append_reasoning("先用工具查清楚再回答")
+        chat_window.append_stream_piece("查到啦")
+        html = chat_window._history.toHtml()
+        assert "思考" in html and "先用工具查清楚" in html and "查到啦" in html
+        assert html.index("先用工具查清楚") < html.index("查到啦")
+
+    def should_show_thinking_before_first_chunk(self, chat_window):
+        """收到首个字之前要显示「思考中」过程，而不是空白或结果直蹦。"""
+        chat_window.load_history([])
+        chat_window.begin_stream_reply()
+        html = chat_window._history.toHtml()
+        assert "思考中" in html
+
+        chat_window.append_stream_piece("画好啦")
+        html2 = chat_window._history.toHtml()
+        assert "画好啦" in html2 and "思考中" not in html2
+
+    def should_finalize_even_with_empty_delta(self, chat_window):
+        chat_window.load_history([])
+        chat_window.begin_stream_reply()
+        chat_window.end_stream_reply("只有完整回复")
+        assert not chat_window.is_streaming_reply
+        assert "只有完整回复" in chat_window._history.toHtml()
 
 
 class TestFileDrop:
@@ -316,6 +394,33 @@ class TestVisibility:
         qtbot.keyClick(chat_window, Qt.Key_Escape)
 
         assert not chat_window.isVisible() and states == [True, False]
+
+    def should_not_hide_on_escape_while_save_dialog_open(self, chat_window, pet_rect, qtbot):
+        """另存对话框期间按 Esc（取消保存）不能把历史窗一起关掉，否则像「清空了」。"""
+        chat_window.show_near(pet_rect)
+        chat_window._dialog_open = True
+        chat_window._esc_shortcut.setEnabled(False)   # QShortcut 不走 keyPressEvent
+        qtbot.keyClick(chat_window, Qt.Key_Escape)
+        assert chat_window.isVisible()
+        chat_window._esc_shortcut.setEnabled(True)
+        chat_window._dialog_open = False
+
+    def should_disable_esc_shortcut_while_saving(self, chat_window, pet_rect,
+                                                  qtbot, monkeypatch):
+        """点保存时真正禁用 QShortcut（以前只拦 keyPressEvent，漏了快捷键）。"""
+        from PySide6.QtCore import QUrl
+        from WisePet.ui import image_io
+
+        img = chat_window._image_paths  # 直接塞一个假图路径
+        img["i-test"] = "C:/fake/cat.png"
+        states = []
+        monkeypatch.setattr(image_io, "save_image_copy",
+                            lambda *a, **k: states.append(chat_window._esc_shortcut.isEnabled())
+                            or "")
+        chat_window.show_near(pet_rect)
+        chat_window._on_anchor_clicked(QUrl("wisepet-save:i-test"))
+        assert states == [False]                      # 对话框期间快捷键已禁用
+        assert chat_window._esc_shortcut.isEnabled()  # 结束后恢复
 
 
 class TestSidePlacement:

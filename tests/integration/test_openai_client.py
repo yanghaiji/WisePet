@@ -150,6 +150,27 @@ class TestErrorMapping:
         assert e.value.kind == AIGatewayError.SERVER
 
     @respx.mock
+    def should_carry_response_body_in_400_detail(self):
+        """"HTTP 400" 谁都看不出原因；必须把网关的错误说明带进日志/事件。"""
+        respx.post(ENDPOINT).mock(return_value=httpx.Response(
+            400, json={"error": {"message": "model 'agnes-3.0-flash' not found"}}))
+        with pytest.raises(AIGatewayError) as e:
+            list(_client().stream_chat(MESSAGES, _cfg()))
+        assert e.value.kind == AIGatewayError.SERVER
+        assert "agnes-3.0-flash" in e.value.detail
+        assert "not found" in e.value.detail
+
+    @respx.mock
+    def should_classify_tools_rejection_as_protocol_for_downgrade(self):
+        """网关明确说不支持 function tools → PROTOCOL，让 agent 回落纯文本。"""
+        respx.post(ENDPOINT).mock(return_value=httpx.Response(
+            400, json={"error": {"message": "tools/function calling not supported"}}))
+        with pytest.raises(AIGatewayError) as e:
+            list(_client().stream_chat(MESSAGES, _cfg()))
+        assert e.value.kind == AIGatewayError.PROTOCOL
+        assert "not supported" in e.value.detail
+
+    @respx.mock
     def should_raise_timeout_when_read_timeout(self):
         respx.post(ENDPOINT).mock(side_effect=httpx.ReadTimeout("slow"))
         with pytest.raises(AIGatewayError) as e:
@@ -173,6 +194,116 @@ class TestErrorMapping:
         with pytest.raises(AIGatewayError) as e:
             list(_client().stream_chat(MESSAGES, _cfg(base_url="not-a-url")))
         assert e.value.kind == AIGatewayError.NETWORK
+
+
+class TestReasoning:
+    @respx.mock
+    def should_deliver_reasoning_separately_from_content(self):
+        """推理模型的思考走 on_reasoning，不混进正文 yield。"""
+        body = (
+            'data: {"choices":[{"delta":{"reasoning_content":"先想一下"}}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"答案"}}]}\n\n'
+            "data: [DONE]\n\n").encode("utf-8")
+        respx.post(ENDPOINT).mock(return_value=httpx.Response(200, content=body))
+        reasons = []
+        chunks = list(_client().stream_chat(MESSAGES, _cfg(),
+                                            on_reasoning=reasons.append))
+        assert chunks == ["答案"]
+        assert reasons == ["先想一下"]
+
+    @respx.mock
+    def should_treat_reasoning_only_stream_as_valid(self):
+        """只有思考没有正文也是有效响应，不该误报协议错误。"""
+        body = ('data: {"choices":[{"delta":{"reasoning_content":"想了半天"}}]}\n\n'
+                "data: [DONE]\n\n").encode("utf-8")
+        respx.post(ENDPOINT).mock(return_value=httpx.Response(200, content=body))
+        reasons = []
+        assert list(_client().stream_chat(MESSAGES, _cfg(),
+                                          on_reasoning=reasons.append)) == []
+        assert reasons == ["想了半天"]
+
+
+class TestImageGeneration:
+    @respx.mock
+    def should_decode_b64_image(self):
+        """首选路径：网关回 b64_json，直接解出图片字节。"""
+        import base64
+        png = b"\x89PNG\r\n\x1a\n" + b"fake-image-bytes"
+        route = respx.post(f"{BASE}/images/generations").mock(return_value=httpx.Response(
+            200, json={"data": [{"b64_json": base64.b64encode(png).decode()}]}))
+
+        data, media = _client().generate_image("画一只猫", _cfg())
+
+        assert data == png and media == "image/png"
+        payload = json.loads(route.calls[0].request.content)
+        assert payload["prompt"] == "画一只猫"
+        assert payload["response_format"] == "b64_json"
+
+    @respx.mock
+    def should_fetch_url_image(self):
+        """兜底路径：网关只给 url，客户端再 GET 图片字节。"""
+        respx.post(f"{BASE}/images/generations").mock(return_value=httpx.Response(
+            200, json={"data": [{"url": "https://img.test.local/a.png"}]}))
+        respx.get("https://img.test.local/a.png").mock(return_value=httpx.Response(
+            200, content=b"PNGDATA", headers={"content-type": "image/png"}))
+
+        data, media = _client().generate_image("a", _cfg())
+        assert data == b"PNGDATA" and media == "image/png"
+
+
+class TestVideoGeneration:
+    @respx.mock
+    def should_create_task_poll_and_download(self, monkeypatch):
+        """异步视频：建任务→轮询→下载；进度回调送到 UI。"""
+        import WisePet.infra.openai_client as oc
+
+        cfg = _cfg(base_url="https://apihub.agnes-ai.com/v1")
+        create = respx.post(f"{cfg.base_url}/videos").mock(
+            return_value=httpx.Response(200, json={"video_id": "v1", "status": "queued"}))
+        status = respx.get("https://apihub.agnes-ai.com/agnesapi").mock(
+            side_effect=[
+                httpx.Response(200, json={"status": "in_progress", "progress": 40}),
+                httpx.Response(200, json={"status": "completed", "progress": 100,
+                                          "url": "https://cdn.example/video.mp4"}),
+            ])
+        movie = respx.get("https://cdn.example/video.mp4").mock(
+            return_value=httpx.Response(200, content=b"MP4DATA",
+                                        headers={"content-type": "video/mp4"}))
+        monkeypatch.setattr(oc.time, "sleep", lambda _s: None)   # 不等 2 秒
+
+        progress = []
+        data, media = _client().generate_video("一只猫跳舞", cfg,
+                                               progress=progress.append)
+        assert data == b"MP4DATA" and media == "video/mp4"
+        assert create.called and status.call_count == 2 and movie.called
+        assert any("40%" in p for p in progress)
+
+    @respx.mock
+    def should_retry_on_429_instead_of_failing_task(self, monkeypatch):
+        """429 查进度限流 ≠ 任务失败：退避后重试，最终拿到视频。"""
+        import WisePet.infra.openai_client as oc
+
+        cfg = _cfg(base_url="https://apihub.agnes-ai.com/v1")
+        respx.post(f"{cfg.base_url}/videos").mock(
+            return_value=httpx.Response(200, json={"video_id": "v2"}))
+        status = respx.get("https://apihub.agnes-ai.com/agnesapi").mock(
+            side_effect=[
+                httpx.Response(429),                                      # 第一次限流
+                httpx.Response(200, json={"status": "completed",
+                                          "url": "https://cdn.example/v2.mp4"}),
+            ])
+        respx.get("https://cdn.example/v2.mp4").mock(
+            return_value=httpx.Response(200, content=b"MP4",
+                                        headers={"content-type": "video/mp4"}))
+        sleeps = []
+        monkeypatch.setattr(oc.time, "sleep", lambda s: sleeps.append(s))
+
+        progress = []
+        data, media = _client().generate_video("猫", cfg, progress=progress.append)
+        assert data == b"MP4" and media == "video/mp4"
+        assert status.call_count == 2, "429 后应重试，不是放弃"
+        assert any("限流" in p for p in progress), "应告诉用户在退避等待"
+        assert any(s >= 3.0 for s in sleeps), "应真的退避等待"
 
 
 class TestProbe:

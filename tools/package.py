@@ -54,7 +54,9 @@ EXCLUDE_MODULES = (
     "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtCharts",
     "PySide6.QtDataVisualization", "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets", "PySide6.QtBluetooth", "PySide6.QtNfc",
-    "PySide6.QtPositioning", "PySide6.QtSensors", "PySide6.QtSerialPort",
+    # 注意：不要排除 QtPositioning——系统精确定位（winrt 后端）依赖它，
+    # 排除后打包版无法拿精确坐标，只能回落 IP 城市级（真机反馈「附近」不准）。
+    "PySide6.QtSensors", "PySide6.QtSerialPort",
     "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtDesigner", "PySide6.QtHelp",
     "tkinter", "matplotlib", "pytest", "IPython",
 )
@@ -279,6 +281,8 @@ def freeze(target: str, icon: Path, *, console: bool, dry_run: bool) -> None:
            "--console" if console else "--windowed"]
     for module in EXCLUDE_MODULES:
         cmd += ["--exclude-module", module]
+    # 系统精确定位：连同 winrt/position 后端数据一起收（缺它打包版无法精确定位）
+    cmd += ["--collect-all", "PySide6.QtPositioning"]
     # jieba 是惰性 import，且自带词典必须随包分发，否则分词能力静默退化
     if importlib.util.find_spec("jieba") is not None:
         cmd += ["--hidden-import", "jieba", "--collect-data", "jieba"]
@@ -325,6 +329,18 @@ def copy_assets(target: str, bundle: Path, *, dry_run: bool) -> None:
     shutil.copytree(ASSETS, destination)
     if not (destination / "pet" / "cat" / "idle" / "01.png").is_file():
         fail(f"素材复制后校验失败：{destination}")
+
+
+def write_version_file(target: str, bundle: Path, version: str,
+                       *, dry_run: bool) -> None:
+    """写版本文件供运行时读取（与 main._runtime_root 的 assets 父目录对齐）。"""
+    dest = bundle if target == "windows" else bundle / "Contents" / "Resources"
+    path = dest / "version.txt"
+    log(f"写入版本文件 {path.name} = {version}")
+    if dry_run:
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    path.write_text(version, encoding="utf-8")
 
 
 def zip_bundle(bundle: Path, version: str, *, dry_run: bool) -> Path:
@@ -557,6 +573,7 @@ def main() -> int:
     freeze(target, icons[target], console=args.console, dry_run=args.dry_run)
     bundle = bundle_dir(target, dry_run=args.dry_run)
     copy_assets(target, bundle, dry_run=args.dry_run)
+    write_version_file(target, bundle, version, dry_run=args.dry_run)
     if not args.dry_run:
         prune_bundle(bundle)
 

@@ -37,6 +37,11 @@ class Pet:
         return self._state_machine.state
 
     @property
+    def vitals(self):
+        """只读视图：供 prompt/UI 读取心情与精力（不提供写，不变量 I3 仍在行为方法）。"""
+        return self._vitals
+
+    @property
     def autonomy_locked(self) -> bool:
         """拖拽/思考/说话期间，自主行为被冻结（不变量 I2）。"""
         return self._state_machine.state in {

@@ -39,6 +39,28 @@ def should_keep_key_hidden_when_dialog_opened(qtbot, base_config):
     assert _SECRET not in dialog._api_key.placeholderText()
 
 
+def should_apply_selected_profile_as_active_after_save(qtbot):
+    """真机 bug：设置里新增第二个方案填好模型、选中保存，却仍用旧模型。"""
+    from WisePet.domain.config_model import AIProfile
+
+    cfg = AppConfig(
+        ai=AIConfig(api_key="k1", model="old-model"),
+        ai_profiles=[AIProfile(name="旧方案", base_url=AIProfile.base_url,
+                               api_key="k1", model="old-model"),
+                     AIProfile(name="新方案", base_url="https://new/v1",
+                               api_key="k2", model="brand-new-model")])
+    dialog = SettingsDialog(cfg)
+    qtbot.addWidget(dialog)
+
+    dialog._profile_combo.setCurrentText("新方案")
+    saved, error = dialog.collect()
+
+    assert error == ""
+    assert saved.ai.model == "brand-new-model"
+    assert saved.ai.base_url == "https://new/v1"
+    assert saved.ai.api_key == "k2"
+
+
 def should_hint_local_mode_when_no_key_stored(qtbot):
     """未配 Key 不是功能缺失：占位文案需告知本地小脑可用（PRD v1.1 C2）。"""
     dialog = SettingsDialog(AppConfig(ai=AIConfig(api_key="")))
@@ -308,13 +330,13 @@ class TestStickerStyle:
 
         assert not dialog.isVisible()
 
-    def should_keep_seven_sections_in_scrollable_card(self, qtbot, base_config):
+    def should_keep_sections_in_scrollable_card(self, qtbot, base_config):
         dialog = SettingsDialog(base_config)
         qtbot.addWidget(dialog)
 
         assert dialog._scroll.widgetResizable()
-        # 5 个业务分区 + 「体验与隐私」+「系统配置」
-        assert len(dialog.findChildren(QFrame, "section")) == 7
+        # 5 个业务分区 + 「体验与隐私」+「数据存储位置」+「系统配置」
+        assert len(dialog.findChildren(QFrame, "section")) == 8
 
     def should_use_same_palette_for_buttons_and_status(self, qtbot, base_config):
         dialog = SettingsDialog(base_config)
@@ -438,6 +460,35 @@ class TestSystemConfigSection:
         assert cfg.system.log_split_by_level is False
         assert cfg.ai.api_key == base_config.ai.api_key
         assert cfg.pet.skin == base_config.pet.skin
+
+
+class TestDataDirSection:
+    """数据存储位置：显示当前路径 + 可选新目录，变更走专门回调。"""
+
+    def should_show_current_data_dir(self, qtbot, base_config):
+        dialog = SettingsDialog(base_config, current_data_dir="D:/mydata/WisePet")
+        qtbot.addWidget(dialog)
+        assert "D:/mydata/WisePet" in dialog._data_dir_current.text()
+
+    def should_route_data_dir_change_to_callback(self, qtbot, base_config):
+        got = {}
+        dialog = SettingsDialog(
+            base_config, current_data_dir="D:/old",
+            on_data_dir_change=lambda target: got.setdefault("target", target)
+            or "成功：已迁移")
+        qtbot.addWidget(dialog)
+        dialog._data_dir_edit.setText("D:/new")
+        dialog._save()
+        assert got["target"] == "D:/new"
+
+    def should_not_change_when_target_equals_current(self, qtbot, base_config):
+        called = []
+        dialog = SettingsDialog(base_config, current_data_dir="D:/same",
+                                on_data_dir_change=lambda t: called.append(t) or "ok")
+        qtbot.addWidget(dialog)
+        dialog._data_dir_edit.setText("D:/same")
+        dialog._save()      # 目标等于当前：走普通保存，不调目录变更回调
+        assert called == []
 
 
 class TestReminderControlsClarity:

@@ -75,7 +75,7 @@ class _RecordingGateway:
     def __init__(self):
         self.calls = []
 
-    def stream_chat(self, messages, cfg):
+    def stream_chat(self, messages, cfg, on_reasoning=None):
         self.calls.append(messages)
         yield "收到"
 
@@ -167,3 +167,21 @@ class TestAIProfiles:
 
         # 坏条目被剔除；当前生效 ai 不在方案里 → 自动补录「默认」保底
         assert [p.name for p in cfg.ai_profiles] == ["好的", "默认"]
+
+    def should_keep_new_profile_without_base_url(self, tmp_path):
+        """新加的方案只填了名字/模型时不能被整条丢弃（否则「新模型」凭空消失）。"""
+        (tmp_path / "config.json").write_text(json.dumps({
+            "ai": {"base_url": "https://x/v4", "api_key": "k1", "model": "old"},
+            "ai_profiles": [
+                {"name": "old", "base_url": "https://x/v4", "api_key": "k1",
+                 "model": "old"},
+                {"name": "new", "model": "brand-new"},
+            ],
+        }), encoding="utf-8")
+
+        from WisePet.infra.config_repo import JsonConfigRepository
+        cfg = JsonConfigRepository(tmp_path).load()
+
+        new = next(p for p in cfg.ai_profiles if p.name == "new")
+        assert new.model == "brand-new"
+        assert new.base_url == AIProfile.base_url

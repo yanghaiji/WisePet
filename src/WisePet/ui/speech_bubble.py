@@ -9,9 +9,11 @@ AI 流式回复也是一张卡：begin_stream 建卡、append_chunk 节流刷新
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QRect, QSize, QTimer, QPoint, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
@@ -74,6 +76,21 @@ QPushButton#ack {
     color: #6B4F3A; font-size: 11px; padding: 3px 12px;
 }
 QPushButton#ack:hover { background: #F3D9A8; }
+QPushButton#cardClose {
+    background: transparent; border: none; color: #B09A7C;
+    font-size: 15px; min-width: 20px; min-height: 20px; padding: 0;
+}
+QPushButton#cardClose:hover { color: #7A5C3D; background: #F7EEDC; border-radius: 7px; }
+QPushButton#saveImage {
+    background: transparent; border: 1px solid #E2CFAF; border-radius: 9px;
+    color: #8A6A45; font-size: 11px; padding: 3px 10px;
+}
+QPushButton#saveImage:hover { background: #F3E1C6; }
+QPushButton#videoBtn {
+    background: #FFF6E8; border: 1px solid #E2CFAF; border-radius: 9px;
+    color: #8A6A45; font-size: 11px; padding: 3px 10px;
+}
+QPushButton#videoBtn:hover { background: #F3D9A8; }
 """
 
 #: 轻量 markdown 转换已被 ui/markdown_render.py 的完整渲染取代（mistune）。
@@ -108,20 +125,49 @@ class _Card:
         self.raw_text = text                    # 原文（markdown 未转换），current_text 用
         self.text_label.setText(render_markdown(text))
 
+        # 本地生成图片（如画图 agent 产出）：内联显示，默认隐藏
+        self.image_label = QLabel(self.frame)
+        self.image_label.setObjectName("bubbleImage")
+        self.image_label.setScaledContents(True)
+        self.image_label.setMaximumHeight(220)
+        self.image_label.hide()
+        self._image_path = ""                   # 当前显示图片的本地路径（供另存）
+        self.save_btn = QPushButton("💾 保存图片", self.frame)
+        self.save_btn.setObjectName("saveImage")
+        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_btn.hide()
+        self.save_btn.clicked.connect(self._save_image)
+        self._video_path = ""
+        self.video_btn = QPushButton("🎬 播放视频（可另存）", self.frame)
+        self.video_btn.setObjectName("videoBtn")
+        self.video_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.video_btn.hide()
+        self.video_btn.clicked.connect(self._play_video)
+
         self.ack_btn = QPushButton("知道啦", self.frame)
         self.ack_btn.setObjectName("ack")
         self.ack_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.ack_btn.setVisible(with_ack)
 
+        self.close_btn = QPushButton("×", self.frame)
+        self.close_btn.setObjectName("cardClose")
+        self.close_btn.setToolTip("关闭这条提示")
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.clicked.connect(lambda: parent.close_card(self.id))
+
         head = QHBoxLayout()
         head.setSpacing(6)
         head.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignTop)
         head.addWidget(self.title_label, 1)
+        head.addWidget(self.close_btn, 0)
         body = QVBoxLayout(self.frame)
         body.setContentsMargins(_BUBBLE_PAD, _BUBBLE_PAD, _BUBBLE_PAD, _BUBBLE_PAD)
         body.setSpacing(6)
         body.addLayout(head)
         body.addWidget(self.text_label)
+        body.addWidget(self.image_label)
+        body.addWidget(self.save_btn)
+        body.addWidget(self.video_btn)
         if with_ack:
             row = QHBoxLayout()
             row.addStretch(1)
@@ -133,6 +179,50 @@ class _Card:
         if duration_ms > 0:
             self.hide_timer.timeout.connect(lambda: parent.close_card(self.id))
             self.hide_timer.start(duration_ms)   # 不 start 就永不消失（真机截图踩过）
+
+    def set_images(self, paths: tuple[str, ...]) -> None:
+        """显示第一张本地图片（多图只显示首张，避免撑爆气泡；其余在历史窗看）。"""
+        self._image_path = ""
+        for raw in paths[:1]:
+            pm = QPixmap(str(raw))
+            if not pm.isNull():
+                self.image_label.setPixmap(pm)
+                self.image_label.show()
+                self._image_path = str(raw)
+                self.save_btn.show()
+                return
+        self.image_label.hide()
+        self.save_btn.hide()
+
+    def _save_image(self) -> None:
+        if not self._image_path:
+            return
+        from .image_io import save_image_copy
+        save_image_copy(self._image_path, self.frame)
+
+    def set_videos(self, paths: tuple[str, ...]) -> None:
+        """显示视频入口（点击用系统播放器打开，并提示可另存）。"""
+        self._video_path = ""
+        for raw in paths[:1]:
+            if Path(str(raw)).is_file():
+                self._video_path = str(raw)
+                self.video_btn.show()
+                return
+        self.video_btn.hide()
+
+    def _play_video(self) -> None:
+        if not self._video_path:
+            return
+        from .video_io import play_video, save_video_copy
+        from PySide6.QtWidgets import QMessageBox
+        answer = QMessageBox.question(
+            self.frame, "视频已生成",
+            f"视频已存到本机：\n{self._video_path}\n\n"
+            "点「Yes」用系统播放器打开，点「No」另存到别处。")
+        if answer == QMessageBox.StandardButton.Yes:
+            play_video(self._video_path)
+        else:
+            save_video_copy(self._video_path, self.frame)
 
 
 class SpeechBubble(QWidget):
@@ -222,8 +312,10 @@ class SpeechBubble(QWidget):
             self._flush_timer.start()
 
     def end_stream(self, full_text: str = "", anchor: QPoint | None = None,
-                   on_close: Callable[[], None] | None = None) -> None:
-        """流结束：立刻刷新全部内容并安排自动消失。"""
+                   on_close: Callable[[], None] | None = None,
+                   images: tuple[str, ...] = (),
+                   videos: tuple[str, ...] = ()) -> None:
+        """流结束：立刻刷新全部内容（含图片）并安排自动消失。"""
         self._flush_timer.stop()
         card = self._cards.get(self._stream_id) if self._stream_id else None
         if card is None:                       # 流卡被提前关掉：补一张完整卡
@@ -234,12 +326,19 @@ class SpeechBubble(QWidget):
         if full_text:
             self._stream_buffer = [full_text]
         self._set_card_text(card, self._current_text().strip())
+        card.set_images(images)
+        card.set_videos(videos)
         if anchor is not None:
             self._anchor = anchor
         if on_close is not None:
             card.on_close = on_close
             self._stream_on_close = on_close
-        card.hide_timer.start(self._duration_ms(self._current_text(), "ai"))
+        # 有图片时延长驻留，给用户时间点「保存图片」
+        duration = self._duration_ms(self._current_text(), "ai")
+        if images or videos:
+            # 20 秒够点播放/保存即可；60 秒太久（且右上角现在有 × 可随时关）
+            duration = max(duration, 20_000)
+        card.hide_timer.start(duration)
         self._place_and_show()
 
     # ---------- 查询 / 移动 ----------

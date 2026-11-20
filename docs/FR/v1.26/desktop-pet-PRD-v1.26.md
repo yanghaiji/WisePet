@@ -47,6 +47,24 @@
 同段把 `base64 --decode`（GNU）换成 Python `base64.b64decode`，因为 macOS runner 自带 BSD
 `base64` 不支持该长选项。新增 7 项纯标准库静态护栏（本机无 actionlint/PyYAML，真解析仍以 GitHub 为准）。
 
+### CI 双平台打包失败修复（用户截图反馈，补登）
+
+用户推送后截图：`build (macos-latest, macos)` **exit code 1**，Artifacts 只有
+`WisePet-windows-main`，无 macos 产物；两条 Node.js 20 弃用警告与 arm64 排队提示与失败无关。
+实证定位两条：
+
+| 项 | 结论 |
+|---|---|
+| 是不是密钥逻辑导致？ | **不是**。未配 secrets 时 `sign_app`/`sign_dmg`/`notarize_dmg` 直接 return，证书导入 step `exit 0` 跳过；且 Windows job 成功说明脚本主干正常。用户仍要求「先不启用密钥」，故 CI 摘掉证书导入 step 与全部签名/公证 env 注入，走纯路径 |
+| 真正根因 | `verify_bundle()` 用 Windows 实测阈值（800 文件 / 160MB）卡 macOS `.app`。`.app` 是 Qt framework 目录树（大量 `Versions/Current` 符号链接、多架构 slice），文件数与体积天然数倍于 onedir；该自检在 **dmg 生成之后**才跑，判失败即 `SystemExit(1)` → 打包步骤失败 → 上传步骤被跳过 → 正好对应「没有 macos artifact」 |
+
+- R4b：`verify_bundle()` 按平台取阈值（macOS 4000 文件 / 600MB，Windows 保持 800 / 160MB），
+  排除符号链接避免重复计数/计体积，`report` 带回 `max_files`/`max_mb`，日志打印实际值与阈值。
+- R4c：CI 加 `if: failure()` 诊断步骤，打印 `dist/` 清单与 `--verify` 结果，不再靠「有没有
+  artifact」反推是哪一步挂了。
+- AC-PUB-6：健康 `.app` 自检通过、符号链接不重复计数、超过 macOS 自身阈值仍判失败、
+  Windows 阈值不受影响；CI 不含任何 secrets 注入且失败诊断步骤存在。
+
 ### 范围外（不假装完成）
 
 - **Apple Developer 账号、`Developer ID Application` 证书、公证权限**属 Apple 硬性要求，

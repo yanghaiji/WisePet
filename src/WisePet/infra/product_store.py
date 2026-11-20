@@ -95,6 +95,10 @@ class MemoryStore:
     _FACT_VALUE_LIMIT = 120
     MAX_FACTS = 50
 
+    #: 自由事实的扩展字段（相关性检索/遗忘/修正用），旧数据缺这些字段时给默认值
+    _FACT_EXTRA = ("tags", "source", "superseded_by", "last_accessed",
+                   "access_count", "importance")
+
     def load_fact_entries(self) -> list[dict]:
         data = load_json_or_backup_reset(self._path) or {}
         raw = data.get("fact_entries")
@@ -106,9 +110,25 @@ class MemoryStore:
                 continue
             key = str(item.get("key") or "").strip()[:self._FACT_KEY_LIMIT]
             value = str(item.get("value") or "").strip()[:self._FACT_VALUE_LIMIT]
-            if key and value:
-                items.append({"key": key, "value": value,
-                              "day": str(item.get("day") or "")})
+            if not key or not value:
+                continue
+            entry = {"key": key, "value": value,
+                     "day": str(item.get("day") or "")}
+            tags = item.get("tags")
+            entry["tags"] = ([str(t) for t in tags if str(t).strip()]
+                             if isinstance(tags, list) else [])
+            entry["source"] = str(item.get("source") or "user")
+            entry["superseded_by"] = str(item.get("superseded_by") or "")
+            entry["last_accessed"] = str(item.get("last_accessed") or entry["day"])
+            try:
+                entry["access_count"] = int(item.get("access_count") or 0)
+            except (TypeError, ValueError):
+                entry["access_count"] = 0
+            try:
+                entry["importance"] = float(item.get("importance") or 1.0)
+            except (TypeError, ValueError):
+                entry["importance"] = 1.0
+            items.append(entry)
         return items
 
     def save_fact_entries(self, entries: list[dict]) -> None:

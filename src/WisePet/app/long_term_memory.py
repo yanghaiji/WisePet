@@ -69,8 +69,12 @@ class LongTermMemory:
         logger.info("long-term memory updated: %s", sorted(changed))
         return True
 
-    def facts(self) -> str:
-        """人话事实摘要；关掉记忆或没记到东西时返回空串。"""
+    def facts(self, query: str = "") -> str:
+        """人话事实摘要；关掉记忆或没记到东西时返回空串。
+
+        query 非空时只挑相关事实（v2）——聊天时按当前问题注入，避免全量灌；
+        query 为空时退回最近 N 条（兼容 timeline/工具召回等无上下文场景）。
+        """
         if not self._enabled():
             return ""
         parts = []
@@ -80,7 +84,8 @@ class LongTermMemory:
             parts.append(f"最近在{self._facts['activity']}")
         if self._facts.get("project"):
             parts.append(f"项目叫{self._facts['project']}")
-        for entry in self._decay_entries():
+        entries = self.relevant(query) if str(query or "").strip() else self._decay_entries()
+        for entry in entries:
             parts.append(f"{entry['key']}：{entry['value']}")
         return ("关于用户的长期记忆（来自本机记录）：" + "；".join(parts) + "。"
                 if parts else "")
@@ -90,10 +95,13 @@ class LongTermMemory:
     #: 进提示词的自由事实条数上限（更多事实靠 agent 的 recall_memories 工具检索）
     PROMPT_ENTRY_LIMIT = 12
 
-    def remember(self, key: str, value: str) -> bool:
+    def remember(self, key: str, value: str, *, source: str = "user",
+                 tags=(), importance: float = 1.0) -> bool:
         """记住一条自由事实（agent 的 remember 工具 / 未来手动入口）。
 
         同 key 覆盖旧值并刷新日期；上限 50 条，超出时挤掉最旧的。
+        source：user=用户明说 / ai=AI 推断 / tool=工具查的（冲突时用户说的优先）。
+        tags：可选主题标签，供相关性检索。
         """
         if not self._enabled():
             return False
@@ -103,7 +111,17 @@ class LongTermMemory:
             return False
         from ..domain.chat_record import day_key
         day = day_key(self._clock.now() if self._clock else None)
-        entry = {"key": key, "value": value, "day": day}
+        old = next((e for e in self._entries if e.get("key") == key), None)
+        # 「改主意了」语义：同 key 新值覆盖旧值，并保留被谁覆盖的记录
+        superseded = str((old or {}).get("key") or "") if old and \
+            str((old or {}).get("value") or "") != value else ""
+        entry = {"key": key, "value": value, "day": day,
+                 "tags": [str(t) for t in (tags or ())][:12],
+                 "source": str(source or "user"),
+                 "superseded_by": superseded,
+                 "last_accessed": day,
+                 "access_count": 0,
+                 "importance": max(0.0, min(3.0, float(importance or 1.0)))}
         self._entries = [e for e in self._entries if e.get("key") != key]
         self._entries.append(entry)
         self._entries = self._entries[-50:]
@@ -111,11 +129,73 @@ class LongTermMemory:
         self._history = self._history[-50:]
         self._store.save_fact_entries(self._entries)
         self._store.save(self._facts, self._history)
-        logger.info("fact remembered: %s", key)
+        logger.info("fact remembered: %s (source=%s)", key, entry["source"])
         return True
 
     def entries(self) -> list[dict]:
         return list(self._entries) if self._enabled() else []
+
+    # ---------- 按相关性检索（v2 优化） ----------
+
+    def relevant(self, query: str, top_k: int = 6) -> list[dict]:
+        """按当前问题挑相关事实（而非全量灌提示词）。
+
+        打分 = 关键词重合 × 重要度 × 时效衰减 × 访问热度；来源 user 优先于 ai/tool。
+        命中过的事实刷新 last_accessed / access_count（记忆越用越牢）。
+        """
+        if not self._enabled() or not str(query or "").strip() or not self._entries:
+            return []
+        from .nlp import Tokenizer, overlap_score
+        tokenizer = Tokenizer()
+        q_grams = tokenizer.grams(str(query))
+        if not q_grams:
+            return []
+        import time as _time
+        now = _time.time() if self._clock is None else self._clock.now()
+        scored: list[tuple[float, dict]] = []
+        for entry in self._entries:
+            e_grams = tokenizer.grams(f"{entry.get('key')} {entry.get('value')} "
+                                      f"{' '.join(entry.get('tags') or [])}")
+            similarity = overlap_score(q_grams, e_grams)
+            if similarity <= 0:
+                continue
+            # 时效衰减：每 30 天衰减一档，最低 0.3（旧事实不该完全消失）
+            age_days = max(0.0, (now - self._to_ts(entry.get("day"))) / 86400.0)
+            recency = max(0.3, 1.0 / (1.0 + age_days / 30.0))
+            importance = float(entry.get("importance") or 1.0)
+            heat = 1.0 + min(0.5, int(entry.get("access_count") or 0) * 0.05)
+            source_boost = {"user": 1.2, "ai": 1.0, "tool": 0.9}.get(
+                str(entry.get("source") or "user"), 1.0)
+            score = similarity * recency * importance * heat * source_boost
+            scored.append((score, entry))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        hits = [entry for _score, entry in scored[:max(1, int(top_k))]]
+        self._touch(hits)
+        return hits
+
+    @staticmethod
+    def _to_ts(day: str) -> float:
+        try:
+            from datetime import datetime
+            return datetime.strptime(str(day or ""), "%Y-%m-%d").timestamp()
+        except ValueError:
+            return 0.0
+
+    def _touch(self, entries: list[dict]) -> None:
+        """刷新命中事实的访问时间与次数（持久化），让常用记忆更牢。"""
+        if not entries:
+            return
+        from ..domain.chat_record import day_key
+        today = day_key(self._clock.now() if self._clock else None)
+        touched = {e.get("key") for e in entries}
+        changed = False
+        for entry in self._entries:
+            if entry.get("key") in touched:
+                entry["last_accessed"] = today
+                entry["access_count"] = int(entry.get("access_count") or 0) + 1
+                changed = True
+        if changed:
+            self._store.save_fact_entries(self._entries)
 
     def delete_entry(self, index: int) -> bool:
         """时间线「按条遗忘」一条自由事实。"""
@@ -149,13 +229,13 @@ class LongTermMemory:
                 break
         return fresh
 
-    def prompt_line(self) -> str:
+    def prompt_line(self, query: str = "") -> str:
         """拼进系统提示词的增量行；无事实时不改变原提示词（保持字节级兼容）。
 
-        事实由 AI 从对话里自动抽取，覆盖任意话题（名字/喜好/住址/约定…）；
-        这里显式声明权威性，避免弱模型把「我没有记忆」当默认回答。
+        query 非空时只带相关事实（v2）；核心三键（名字/近况/项目）永远带，
+        因为它们短且高频有用。显式声明权威性，避免弱模型说「我没有记忆」。
         """
-        facts = self.facts()
+        facts = self.facts(query)
         if not facts:
             return ""
         return ("\n【长期记忆 · 权威事实】" + facts

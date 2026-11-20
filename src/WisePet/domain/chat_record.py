@@ -26,15 +26,23 @@ class ChatRecord:
     source: str = ""
     ts: float = 0.0
     session_id: str = ""
+    images: tuple[str, ...] = ()   # agent 生成的本地图片路径（受信任，可内联渲染）
+    videos: tuple[str, ...] = ()   # agent 生成的本地视频路径
 
     def to_dict(self) -> dict:
         return {"role": self.role, "content": self.content, "source": self.source,
-                "ts": self.ts, "session_id": self.session_id}
+                "ts": self.ts, "session_id": self.session_id,
+                "images": list(self.images), "videos": list(self.videos)}
 
     @classmethod
     def from_dict(cls, data: dict) -> "ChatRecord":
+        raw_images = data.get("images") or ()
+        images = tuple(str(x) for x in raw_images) if isinstance(raw_images, list) else ()
+        raw_videos = data.get("videos") or ()
+        videos = tuple(str(x) for x in raw_videos) if isinstance(raw_videos, list) else ()
         return cls(role=str(data.get("role") or ""),
                    content=str(data.get("content") or ""),
                    source=str(data.get("source") or ""),
                    ts=float(data.get("ts") or 0.0),
-                   session_id=str(data.get("session_id") or ""))
+                   session_id=str(data.get("session_id") or ""),
+                   images=images, videos=videos)

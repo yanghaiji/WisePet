@@ -49,6 +49,23 @@ class TestProcessNext:
         assert len(done) == 1 and done[0].reply == "你好呀"
         assert session.last_role == "assistant"
 
+    def should_carry_channel_to_all_chunk_events(self):
+        """来源通道要透传到每个 chunk，主程序才能分流到气泡或历史窗。"""
+        gateway = FakeGateway(chunks=["你", "好"])
+        service, _, collected, session = make_service(gateway)
+        service.send("hi", channel="history")
+        service.process_next()
+        chunks = [e for e in collected if isinstance(e, ChatReplyChunkEvent)]
+        assert chunks and all(e.channel == "history" for e in chunks)
+
+    def should_default_channel_to_input_for_legacy_send(self):
+        gateway = FakeGateway(chunks=["ok"])
+        service, _, collected, session = make_service(gateway)
+        service.send("hi")                       # 不传 channel，默认 input
+        service.process_next()
+        chunks = [e for e in collected if isinstance(e, ChatReplyChunkEvent)]
+        assert chunks and all(e.channel == "input" for e in chunks)
+
     def should_build_messages_with_system_prompt_when_processing(self):
         gateway = FakeGateway(chunks=["ok"])
         service, _, _, _ = make_service(gateway, prompt="你是小墨")

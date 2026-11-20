@@ -71,7 +71,8 @@ def should_publish_error_phase_and_fallback_turn_when_gateway_fails():
 
     errors = [e for e in collected if isinstance(e, ChatStateChangedEvent)
               and e.phase == PHASE_ERROR]
-    assert len(errors) == 1 and errors[0].detail == AIGatewayError.NETWORK
+    # detail 现在带网关原始原因（offline），用户不必翻日志就知道哪里错了
+    assert len(errors) == 1 and errors[0].detail == "offline"
     assert ("assistant", service.fallback_text(AIGatewayError.NETWORK),
             "fallback") in _turns(collected)
 

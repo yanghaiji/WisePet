@@ -14,8 +14,9 @@ from typing import Callable
 
 from ..domain.events import SpeakRequestedEvent
 from ..domain.task_protocol import (
-    FOLLOWUP, MAX_FILE_BYTES, WATCH_FILE, TaskSpec, backoff_seconds,
-    describe_task, is_done_signal, is_safe_read_target,
+    FOLLOWUP, MAX_FILE_BYTES, WATCH_FILE, WATCH_PAGE, TaskSpec, backoff_seconds,
+    describe_task, is_done_signal, is_safe_read_target, is_safe_watch_url,
+    page_changed,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,13 +24,15 @@ logger = logging.getLogger(__name__)
 
 class TaskService:
     def __init__(self, clock, bus, config_provider: Callable[[], object], store,
-                 audit=None, enabled_provider: Callable[[], bool] | None = None):
+                 audit=None, enabled_provider: Callable[[], bool] | None = None,
+                 page_fetcher: Callable[[str], str] | None = None):
         self._clock = clock
         self._bus = bus
         self._config = config_provider
         self._store = store
         self._audit = audit
         self._enabled = enabled_provider
+        self._page_fetcher = page_fetcher   # WATCH_PAGE 用：url -> 页面文本
         self._tasks: list[TaskSpec] = [
             TaskSpec.from_dict(item) for item in self._store.load()
             if str(item.get("id") or "")]
@@ -115,6 +118,8 @@ class TaskService:
         for task in due:
             if task.kind == WATCH_FILE:
                 changed = self._run_watch(task, now) or changed
+            elif task.kind == WATCH_PAGE:
+                changed = self._run_watch_page(task, now) or changed
             elif task.kind == FOLLOWUP:
                 changed = self._run_followup(task, now) or changed
         if changed:
@@ -138,6 +143,34 @@ class TaskService:
                 self._audit.record("task_watch", task.target, "matched")
             return True
         self._tasks[index] = self._patch(task, next_at=now + max(30.0, task.interval_s))
+        return True
+
+    def _run_watch_page(self, task: TaskSpec, now: float) -> bool:
+        index = self._index(task.id)
+        if index < 0:
+            return False
+        if self._page_fetcher is None or not is_safe_watch_url(task.target):
+            return self._fail(task, index, now, "网页地址不可用或不安全")
+        try:
+            text = str(self._page_fetcher(task.target) or "")
+        except Exception as exc:  # noqa: BLE001 - 抓取失败走退避
+            return self._fail(task, index, now, str(exc))
+        meta = dict(task.meta or {})
+        previous = str(meta.get("baseline") or "")
+        keyword = str(task.match or meta.get("keyword") or "")
+        # 首抓只记基线不出声；之后关键词出现或内容变化才告诉用户
+        if previous and page_changed(previous, text, keyword):
+            self._publish(f"你让我盯的网页{'出现「'+keyword+'」' if keyword else '有变化'}啦，快去看看～",
+                          "我盯着的事有动静了")
+            if keyword:   # 关键词命中即停；纯变化监控继续盯
+                self._tasks[index] = self._patch(task, status="done",
+                                                 tries=task.tries + 1)
+                if self._audit is not None:
+                    self._audit.record("task_watch_page", task.target, "matched")
+                return True
+        meta["baseline"] = text[:20000]   # 存一段文本作下次对比基线（限长防膨胀）
+        self._tasks[index] = self._patch(
+            task, meta=meta, next_at=now + max(60.0, task.interval_s))
         return True
 
     def _run_followup(self, task: TaskSpec, now: float) -> bool:

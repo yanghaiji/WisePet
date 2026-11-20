@@ -59,6 +59,10 @@ class CompanionService:
             logger.info("presence gap: %.1f hours", self._gap_hours)
         return self._gap_hours
 
+    def gap_hours(self) -> float:
+        """离开时长（小时）；prompt/UI 只读取，不触发任何行为。"""
+        return self._gap_hours
+
     def reunion_text(self) -> str | None:
         """久别重逢的本地话术；不够久或用户关了开关则返回 None。"""
         cfg = self._config().companion

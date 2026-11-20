@@ -59,6 +59,14 @@ class TestWindowControls:
         assert chat_input._max_btn.text() == "▢"
         assert chat_input._close_btn.text() == "×"
 
+    def should_emit_history_requested_when_button_clicked(self, chat_input):
+        """输入条「聊天记录」按钮 → 发信号让主程序打开历史窗（用户主动、不自动跳）。"""
+        seen = []
+        chat_input.history_requested.connect(lambda: seen.append(1))
+        assert chat_input._history_btn.text() == "聊天记录"
+        chat_input._history_btn.click()
+        assert seen == [1]
+
     def should_hide_when_minimize_clicked(self, chat_input):
         chat_input._min_btn.click()
         assert not chat_input.isVisible()
@@ -112,6 +120,12 @@ class TestChatInputState:
 
         chat_input.set_state(PHASE_REPLYING, "local")
         assert "正在回复" in chat_input.status_text and "本地小脑" in chat_input.status_text
+
+    def should_show_progress_detail_while_thinking(self, chat_input):
+        """视频生成的异步进度走 thinking+detail，必须显示（以前只显示 error 的）。"""
+        chat_input.set_state(PHASE_THINKING, "ai", detail="视频生成中 40%")
+        assert "思考中" in chat_input.status_text
+        assert "视频生成中 40%" in chat_input.status_text
 
     def should_show_error_detail_when_phase_error(self, chat_input):
         chat_input.set_state(PHASE_ERROR, "ai", detail="TIMEOUT")

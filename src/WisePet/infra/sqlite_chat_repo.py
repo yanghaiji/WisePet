@@ -10,6 +10,7 @@ O(n²)，换库收益全在这里。sqlite3 是标准库，不引入任何新依
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import sqlite3
@@ -27,7 +28,7 @@ CHAT_DIR_NAME = "chat"
 LEGACY_DIR_NAME = "legacy"
 LEGACY_SUFFIX = ".migrated"
 
-_FIELDS = "role, content, source, ts, session_id"
+_FIELDS = "role, content, source, ts, session_id, images, videos"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_turns (
@@ -38,6 +39,9 @@ CREATE TABLE IF NOT EXISTS chat_turns (
     content TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
+    images TEXT NOT NULL DEFAULT '[]',  -- JSON 数组：本地生成图片路径
+    videos TEXT NOT NULL DEFAULT '[]',  -- JSON 数组：本地生成视频路径
+    terms TEXT NOT NULL DEFAULT '',     -- 分词后的检索词（空格分隔，v2 相关性检索）
     legacy_key TEXT UNIQUE            -- 迁移幂等：{原文件名}:{序号}
 );
 CREATE INDEX IF NOT EXISTS idx_chat_turns_day ON chat_turns(day, id);
@@ -45,9 +49,31 @@ CREATE INDEX IF NOT EXISTS idx_chat_turns_ts ON chat_turns(ts DESC);
 """
 
 
+def _search_terms(text: str) -> str:
+    """为检索生成词元（中文相邻二字 + 英文整词），空格分隔存进 terms 列。
+
+    infra 层不依赖 app.nlp（分层），这里用极简版本；比纯 instr 子串召回更宽，
+    「那个活儿」与「做项目」仍不会误命中，但「周报」变「写周报」能命中。
+    """
+    import re as _re
+    raw = str(text or "").lower()
+    words = _re.findall(r"[a-z0-9_]{2,}", raw)
+    cjk = _re.sub(r"[a-z0-9_\s]", "", raw)
+    grams = [cjk[i:i + 2] for i in range(len(cjk) - 1)] if len(cjk) > 1 else \
+        ([cjk] if cjk else [])
+    return " ".join(dict.fromkeys(words + grams))[:2000]
+
+
 def _to_record(row) -> ChatRecord:
+    def _paths(index):
+        try:
+            raw = json.loads(row[index]) if len(row) > index and row[index] else []
+            return tuple(str(x) for x in raw) if isinstance(raw, list) else ()
+        except (json.JSONDecodeError, TypeError):
+            return ()
     return ChatRecord(role=row[0], content=row[1], source=row[2],
-                      ts=float(row[3] or 0.0), session_id=row[4])
+                      ts=float(row[3] or 0.0), session_id=row[4],
+                      images=_paths(5), videos=_paths(6))
 
 
 class SqliteChatRepository:
@@ -85,18 +111,22 @@ class SqliteChatRepository:
                legacy_key: str | None = None) -> None:
         """真追加一条 INSERT，不再读全量重写当天文件。"""
         day = day or day_key(record.ts or None)
+        images_json = json.dumps(list(record.images), ensure_ascii=False)
+        videos_json = json.dumps(list(getattr(record, "videos", ()) or ()), ensure_ascii=False)
+        terms = _search_terms(record.content)
         values = (day, float(record.ts or 0.0), record.role, record.content,
-                  record.source, record.session_id)
+                  record.source, record.session_id, images_json, videos_json, terms)
         with closing(self._connect()) as conn:
             if legacy_key is None:
                 conn.execute(
-                    "INSERT INTO chat_turns(day,ts,role,content,source,session_id) "
-                    "VALUES(?,?,?,?,?,?)", values)
+                    "INSERT INTO chat_turns"
+                    "(day,ts,role,content,source,session_id,images,videos,terms) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)", values)
             else:
                 conn.execute(
                     "INSERT OR IGNORE INTO chat_turns"
-                    "(day,ts,role,content,source,session_id,legacy_key) "
-                    "VALUES(?,?,?,?,?,?,?)", values + (legacy_key,))
+                    "(day,ts,role,content,source,session_id,images,videos,terms,legacy_key) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)", values + (legacy_key,))
             conn.commit()
 
     def load(self, day: str) -> list[ChatRecord]:
@@ -113,19 +143,41 @@ class SqliteChatRepository:
         return [row[0] for row in rows]
 
     def search(self, query: str, limit: int = 50) -> list[ChatRecord]:
-        """跨日子串检索，大小写不敏感、按时间倒序；一次 SQL，不扫一堆按天文件。
+        """跨日检索，大小写不敏感、按时间倒序、相关度优先。
 
-        中文靠 instr 做子串匹配（FTS5 默认不切中文，这里用不上）。
+        v2：优先用词元匹配（terms 列，召回更宽）；旧数据 terms 为空时退回
+        content 子串匹配。两种命中合并去重，词元命中的排前面。
         """
         needle = str(query or "").strip()
         if not needle or limit <= 0:
             return []
+        terms = _search_terms(needle).split()
         with closing(self._connect()) as conn:
-            rows = conn.execute(
+            # 词元匹配：任一查询词命中 terms 列
+            term_rows: list = []
+            if terms:
+                clauses = " OR ".join("instr(terms, ?) > 0" for _ in terms)
+                term_rows = conn.execute(
+                    f"SELECT {_FIELDS} FROM chat_turns WHERE ({clauses}) "
+                    "ORDER BY ts DESC, id DESC LIMIT ?",
+                    tuple(terms) + (limit,)).fetchall()
+            # 子串兜底（兼容 terms 为空的旧行，或精确短语查询）
+            sub_rows = conn.execute(
                 f"SELECT {_FIELDS} FROM chat_turns "
                 "WHERE instr(lower(content), lower(?)) > 0 "
                 "ORDER BY ts DESC, id DESC LIMIT ?", (needle, limit)).fetchall()
-        return [_to_record(row) for row in rows]
+        # 合并去重（按 content+ts 判重），词元结果优先
+        seen: set[tuple] = set()
+        merged: list = []
+        for row in term_rows + sub_rows:
+            key = (row[1], row[3])           # (content, ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+            if len(merged) >= limit:
+                break
+        return [_to_record(row) for row in merged]
 
     def count(self) -> int:
         with closing(self._connect()) as conn:
@@ -152,6 +204,17 @@ class SqliteChatRepository:
     def _create_tables(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+            # 旧库没有 images 列：补列（默认 '[]'，旧记录无图）
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_turns)")}
+            if "images" not in cols:
+                conn.execute("ALTER TABLE chat_turns ADD COLUMN images "
+                             "TEXT NOT NULL DEFAULT '[]'")
+            if "terms" not in cols:
+                conn.execute("ALTER TABLE chat_turns ADD COLUMN terms "
+                             "TEXT NOT NULL DEFAULT ''")
+            if "videos" not in cols:
+                conn.execute("ALTER TABLE chat_turns ADD COLUMN videos "
+                             "TEXT NOT NULL DEFAULT '[]'")
             conn.commit()
 
     def _backup_corrupt_db(self) -> None:

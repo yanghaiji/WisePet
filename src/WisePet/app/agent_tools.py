@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
+from ..domain.errors import AIGatewayError
 from .action_protocol import (
     CreateFileAction, MakePptAction, RemindAction, describe_action,
 )
@@ -73,6 +76,9 @@ TOOL_SCHEMAS: list[dict] = [
         ["query"]),
     _fn("get_location", "获取用户当前的大致位置（IP 城市级，用于附近搜索/天气）。",
         {}, []),
+    _fn("get_weather", "查当前所在城市的天气实况（温度/晴雨）。用户问天气、"
+        "冷不冷、下不下雨、要不要带伞时必须先调这个工具拿真实结果，不要凭记忆回答。",
+        {}, []),
     _fn("nearby_pois", "查用户附近的本地生活场所（美食/咖啡/超市/加油站等）。"
         "用户问「附近的xx」时必须先调这个工具拿真实结果，绝对不要凭记忆编造店名。",
         {"keyword": {"type": "string",
@@ -82,12 +88,29 @@ TOOL_SCHEMAS: list[dict] = [
          "radius_km": {"type": "number",
                        "description": "搜索半径公里数，默认 3"}},
         ["keyword"]),
+    _fn("recall", "统一记忆检索：用户提到「之前/上次/记得吗/我说过」或需要翻旧账时，"
+        "用它一次查遍长期记忆、历史聊天、资料、近况和摘要（比分别查更全）。",
+        {"question": {"type": "string",
+                      "description": "要找什么，尽量用用户原话里的实词"}},
+        ["question"]),
+    _fn("generate_image", "按用户的描述生成一张图片（画图/画一只猫/生成插画）。"
+        "用户说「画一张」「画个」「生成图片」「来张图」等明确要图时必须调用这个工具，"
+        "不要只回文字描述。",
+        {"prompt": {"type": "string",
+                    "description": "画面描述，尽量保留用户原话里的主体、风格、颜色"}},
+        ["prompt"]),
+    _fn("generate_video", "按用户的描述生成一段短视频（要视频/拍一段/做个动画）。"
+        "视频是异步生成，可能要几十秒到几分钟，提交后会持续报告进度；"
+        "用户明确要视频时必须调用，不要说「我不会拍视频」。",
+        {"prompt": {"type": "string",
+                    "description": "视频画面描述：主体、动作、镜头、风格，尽量用用户原话"}},
+        ["prompt"]),
 ]
 
 _READ_TOOLS = frozenset({
     "read_file", "list_folder", "search_knowledge", "search_history",
-    "recall_memories", "get_status", "web_search", "get_location",
-    "nearby_pois",
+    "recall_memories", "recall", "get_status", "web_search", "get_location",
+    "get_weather", "nearby_pois",
 })
 
 #: 循环内直接执行的工具（只读 + 无副作用的记忆写入）
@@ -98,8 +121,15 @@ class AgentToolbox:
     def __init__(self, *, knowledge=None, chat_history=None, memory_service=None,
                  tasks=None, pet=None, config_provider: Callable[[], object] | None = None,
                  remind_callback: Callable[[RemindAction], None] | None = None,
-                 web_search=None, geo=None, amap=None,
-                 location_consent: Callable[[], bool] | None = None):
+                 web_search=None, geo=None, amap=None, weather=None,
+                 location_consent: Callable[[], bool] | None = None,
+                 image_gateway=None, image_dir: str | Path | None = None,
+                 image_cfg_provider: Callable[[], object] | None = None,
+                 video_gateway=None, video_dir: str | Path | None = None,
+                 video_cfg_provider: Callable[[], object] | None = None,
+                 video_progress: Callable[[str], None] | None = None,
+                 video_task: Callable[[str, str, str], None] | None = None,
+                 unified_memory=None):
         self._knowledge = knowledge
         self._chat_history = chat_history
         self._memory = memory_service
@@ -107,12 +137,27 @@ class AgentToolbox:
         self._pet = pet
         self._config_provider = config_provider
         self._remind_callback = remind_callback
+        # 图像生成：网关 + 落盘目录 + 「取 image 用途方案」的提供者；本次工具产出
+        # 的图片路径记在这里，由 AgentRunner 每轮取走塞进 AgentOutcome 回传 UI。
+        self._image_gateway = image_gateway
+        self._image_dir = Path(image_dir).expanduser() if image_dir else None
+        self._image_cfg = image_cfg_provider
+        # 视频生成：异步网关 + 落盘目录 + 「取 video 用途方案」的提供者
+        self._video_gateway = video_gateway
+        self._video_dir = Path(video_dir).expanduser() if video_dir else None
+        self._video_cfg = video_cfg_provider
+        self._video_progress = video_progress
+        self._video_task = video_task
+        self._unified_memory = unified_memory
+        self.generated_images: list[str] = []
+        self.generated_videos: list[str] = []
         # 联网能力（可选注入）：web_search 为 WebSearchGateway，geo 为 GeoLocator，
         # amap 为 AmapPoiGateway；location_consent 在需要授权弹窗时由组装根注入
         # （worker 线程阻塞等待用户选择）
         self._web = web_search
         self._geo = geo
         self._amap = amap
+        self._weather = weather
         self._consent = location_consent
 
     @property
@@ -142,6 +187,10 @@ class AgentToolbox:
                 return self._execute_get_location(), None
             if name == "nearby_pois":
                 return self._execute_nearby_pois(args), None
+            if name == "generate_image":
+                return self._execute_generate_image(arguments)
+            if name == "generate_video":
+                return self._execute_generate_video(arguments)
             if name == "remind":
                 return self._execute_remind(arguments)
             if name == "create_file":
@@ -155,9 +204,106 @@ class AgentToolbox:
             logger.info("tool %s failed: %s", name, exc)
             return f"工具执行失败：{exc}", None
 
+    def _execute_generate_image(self, arguments: dict) -> tuple[str, None]:
+        """调 image 用途的模型生成图片，落到本身份目录，路径记入本次产出。"""
+        prompt = str(arguments.get("prompt") or "").strip()[:_MAX_ARG_TEXT]
+        if not prompt:
+            return "画图描述为空，没画成", None
+        if self._image_gateway is None or self._image_cfg is None or self._image_dir is None:
+            return "画图功能未启用：请在设置里添加一个「用途=image」的模型方案", None
+        try:
+            cfg = self._image_cfg()
+            if cfg is None:
+                return "还没配置画图模型：请在设置里添加一个「用途=image」的模型方案", None
+            data, media = self._image_gateway.generate_image(prompt, cfg)
+        except AIGatewayError as exc:
+            logger.info("generate_image failed [%s]: %s", exc.kind, exc.detail)
+            return f"画图失败：{exc.detail}", None
+        except (OSError, ValueError) as exc:
+            logger.info("generate_image failed: %s", exc)
+            return f"画图失败：{exc}", None
+        # 落盘：扩展名按媒体类型，文件名带时间戳+随机，避免覆盖
+        ext = ".jpg" if "jpeg" in media else ".png"
+        name = f"img-{int(time.time())}-{uuid.uuid4().hex[:8]}{ext}"
+        try:
+            self._image_dir.mkdir(parents=True, exist_ok=True)
+            path = self._image_dir / name
+            path.write_bytes(data)
+        except OSError as exc:
+            logger.info("generated image save failed: %s", exc)
+            return f"图片生成了但保存失败：{exc}", None
+        self.generated_images.append(str(path))
+        return f"已经画好了，图片在：{path}", None
+
+    def _execute_generate_video(self, arguments: dict) -> tuple[str, None]:
+        """调 video 用途的模型生成视频（异步），成片落盘并记入本次产出。"""
+        import itertools
+        _video_seq = getattr(self, "_video_seq_gen", None)
+        if _video_seq is None:
+            _video_seq = self._video_seq_gen = itertools.count(1)
+        task_id = f"video-{next(_video_seq)}"
+
+        def emit(status: str, text: str = "", path: str = "") -> None:
+            if self._video_task is not None:
+                try:
+                    self._video_task(task_id, status, text, path)
+                except Exception:  # noqa: BLE001 - 通知失败不影响生成
+                    logger.debug("video task event failed", exc_info=True)
+
+        prompt = str(arguments.get("prompt") or "").strip()[:_MAX_ARG_TEXT]
+        if not prompt:
+            emit("failed", "视频描述为空")
+            return "视频描述为空，没做成", None
+        if self._video_gateway is None or self._video_cfg is None or self._video_dir is None:
+            msg = "视频功能未启用：请在设置里添加一个「用途=video」的模型方案"
+            emit("failed", msg)
+            return msg, None
+        emit("submitted", "视频任务已提交，正在排队…")
+        try:
+            cfg = self._video_cfg()
+            if cfg is None:
+                msg = "还没配置视频模型：请在设置里添加一个「用途=video」的模型方案"
+                emit("failed", msg)
+                return msg, None
+            data, media = self._video_gateway.generate_video(
+                prompt, cfg, progress=self._video_progress)
+        except AIGatewayError as exc:
+            logger.info("generate_video failed [%s]: %s", exc.kind, exc.detail)
+            emit("failed", exc.detail)
+            return (f"视频生成失败：{exc.detail}。"
+                    "这次工具调用已经结束，你没有重试机会了；"
+                    "请如实告诉用户视频没做成和原因，不要说「我再试试」「给你生成中」"
+                    "这类正在生成的话——那会让用户空等。"), None
+        except (OSError, ValueError) as exc:
+            logger.info("generate_video failed: %s", exc)
+            emit("failed", str(exc))
+            return (f"视频生成失败：{exc}。请如实告诉用户没做成，"
+                    "不要说「生成中」或承诺重试。"), None
+        ext = ".webm" if "webm" in media else ".mp4"
+        name = f"video-{int(time.time())}-{uuid.uuid4().hex[:8]}{ext}"
+        try:
+            self._video_dir.mkdir(parents=True, exist_ok=True)
+            path = self._video_dir / name
+            path.write_bytes(data)
+        except OSError as exc:
+            logger.info("generated video save failed: %s", exc)
+            emit("failed", str(exc))
+            return f"视频生成了但保存失败：{exc}", None
+        self.generated_videos.append(str(path))
+        emit("done", "视频生成完成", str(path))
+        return f"视频做好了，文件在：{path}", None
+
     # ---------- 只读工具 ----------
 
     def _execute_read(self, name: str, args: dict) -> str:
+        if name == "recall":
+            if self._unified_memory is None:
+                return "统一记忆检索不可用"
+            hits = self._unified_memory.recall(str(args.get("question") or ""))
+            if not hits:
+                return "记忆里没有找到相关内容"
+            return "\n".join(f"[{h.source}{' ' + h.detail if h.detail else ''}]"
+                             f" {h.text[:300]}" for h in hits)
         if name == "read_file":
             path = self._resolve_in_folder(str(args.get("path") or ""))
             if path is None:
@@ -204,11 +350,51 @@ class AgentToolbox:
             return self._execute_web_search(args)
         if name == "get_location":
             return self._execute_get_location()
+        if name == "get_weather":
+            return self._execute_get_weather()
         if name == "nearby_pois":
             return self._execute_nearby_pois(args)
         return f"未知工具 {name}"
 
     # ---------- 联网工具 ----------
+
+    def _execute_get_weather(self) -> str:
+        """即时天气查询：用户主动问才调，不受「主动天气推送」开关影响。"""
+        if self._weather is None:
+            return ("天气工具暂不可用。请如实告诉用户你这边查不到实时天气，"
+                    "不要编造温度或天气状况，可以建议用户看手机天气应用")
+        snap = self._weather.fetch() if hasattr(self._weather, "fetch") else None
+        if snap is None:
+            return ("暂时取不到天气（网络或定位不可用）。请如实说明查不到，"
+                    "不要编造温度/晴雨，可建议用户查看手机天气应用")
+        from ..domain.weather import format_report
+        report = format_report(
+            city=getattr(snap, "city", ""), code=snap.code, temp=snap.temp,
+            humidity=getattr(snap, "humidity", ""), wind=getattr(snap, "wind", ""),
+            high=getattr(snap, "high", ""), low=getattr(snap, "low", ""),
+            notice=getattr(snap, "notice", ""),
+            observed_at=getattr(snap, "observed_at", ""))
+        return (report + "\n\n——以上是要展示给用户的天气卡片，"
+                "请把这段 markdown 原样输出（保留 ### 标题、- 列表、> 引用和所有加粗），"
+                "不要改写成一整段话、不要去掉格式符号。"
+                "可以在最后另加一句你自己的宠物口吻关心话，"
+                "但不要改动卡片本身，也不要编造这里没有的数字。")
+
+    #: 关键词末尾的场所类型词（从「桂林路 咖啡」里剥掉「咖啡」留下区域名「桂林路」）
+    _PLACE_WORDS = ("美食", "咖啡", "咖啡馆", "餐厅", "饭店", "超市", "便利店",
+                    "加油", "加油站", "药店", "医院", "学校", "酒店", "宾馆",
+                    "奶茶", "火锅", "烧烤", "小吃", "停车", "停车场", "银行")
+
+    @classmethod
+    def _extract_area(cls, keyword: str) -> str:
+        """从「区域 + 类型」的关键词里提取区域名；纯类型词返回空串。"""
+        parts = [p for p in str(keyword or "").replace(",", " ").split() if p]
+        if len(parts) < 2:
+            return ""
+        # 去掉末尾的场所类型词，剩下的拼成区域名
+        area_parts = [p for p in parts
+                      if not any(word in p for word in cls._PLACE_WORDS)]
+        return "".join(area_parts).strip()[:40]
 
     def _location_denial(self) -> str | None:
         """位置权限闸门：返回 None 表示放行，否则返回给模型的人话拒绝文案。"""
@@ -273,18 +459,28 @@ class AgentToolbox:
             radius_km = float(radius_km) if radius_km else 3.0
         except (TypeError, ValueError):
             radius_km = 3.0
-        pois = self._amap.search_around(keyword, info.lat, info.lon,
+        # 精确定位不可用时（IP 城市中心误差几公里），若用户提到了区域名，
+        # 先按区域名地理编码到街道级中心点——否则搜出来全是市中心的店。
+        lat, lon, center_note = info.lat, info.lon, info.text
+        area = self._extract_area(keyword)
+        if area and not info.precise and self._amap is not None:
+            geo = self._amap.geocode(area, city=getattr(info, "city", "") or "")
+            if geo is not None:
+                lat, lon = geo
+                center_note = f"{info.city or ''}{area}附近（按区域名精确定位）"
+        pois = self._amap.search_around(keyword, lat, lon,
                                         int(radius_km * 1000))
         if not pois:
             return (f"{radius_km:g}km 内没搜到「{keyword}」相关的场所"
-                    f"（当前位置：{info.text}）。可以建议用户加大半径，"
+                    f"（搜索中心：{center_note}）。可以建议用户加大半径、"
+                    "或说出更具体的区域（如「XX路」「XX区」），"
                     "或如实说明暂时查不到，不要编造店铺")
         lines = []
         for i, p in enumerate(pois, 1):
             dist = f"，距你约 {p.distance_m} 米" if p.distance_m else ""
             tel = f"，电话 {p.tel}" if p.tel else ""
             lines.append(f"{i}. {p.name}（{p.address}{dist}{tel}）")
-        return (f"用户位置：{info.text}。附近「{keyword}」搜索结果：\n"
+        return (f"搜索中心：{center_note}。附近「{keyword}」搜索结果：\n"
                 + "\n".join(lines))
 
     def _nearby_fallback_web(self, keyword: str) -> str:

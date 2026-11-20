@@ -49,11 +49,11 @@ def should_roundtrip_assistant_settings_in_dialog(qtbot):
     assert result.companion.enabled is True             # 其它分节不丢
 
 
-def should_keep_seven_sections(qtbot):
+def should_keep_sections(qtbot):
     from PySide6.QtWidgets import QFrame
     dlg = SettingsDialog(AppConfig(), skin_options=["cat"])
     qtbot.addWidget(dlg)
-    assert len(dlg.findChildren(QFrame, "section")) == 7
+    assert len(dlg.findChildren(QFrame, "section")) == 8   # 含「数据存储位置」
 
 
 # ---------- 托付快速通道与完成信号 ----------

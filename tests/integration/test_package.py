@@ -31,6 +31,15 @@ def should_exclude_unused_qt_modules_but_keep_pptx_dependencies():
     assert not any(name in pkg.EXCLUDE_MODULES for name in ("lxml", "PIL", "pptx"))
 
 
+def should_keep_qt_positioning_for_precise_location():
+    """系统精确定位依赖 QtPositioning；排除会让打包版只能 IP 城市级（真机教训）。"""
+    assert "PySide6.QtPositioning" not in pkg.EXCLUDE_MODULES
+    # 冻结命令要连同后端一起收集
+    import inspect
+    src = inspect.getsource(pkg.freeze)
+    assert "--collect-all" in src and "PySide6.QtPositioning" in src
+
+
 def should_fail_verification_when_exe_or_assets_are_missing(tmp_path):
     report = pkg.verify_bundle(tmp_path / "WisePet", "windows")
     assert report["ok"] is False
@@ -46,6 +55,68 @@ def should_fail_verification_when_file_count_exceeds_budget(tmp_path, monkeypatc
     monkeypatch.setattr(pkg, "MAX_BUNDLE_FILES", 1)
     report = pkg.verify_bundle(_healthy_bundle(tmp_path), "windows")
     assert report["ok"] is False and report["files"] == 2
+
+
+def _healthy_macos_bundle(tmp_path: Path) -> Path:
+    """模拟 PyInstaller 的 .app 目录树（exe 在 Contents/MacOS，素材同源）。"""
+    bundle = tmp_path / "WisePet.app"
+    macos = bundle / "Contents" / "MacOS"
+    macos.mkdir(parents=True)
+    (macos / "WisePet").write_bytes(b"exe")
+    assets = macos / "assets" / "pet" / "cat" / "idle"
+    assets.mkdir(parents=True)
+    (assets / "01.png").write_bytes(b"png")
+    return bundle
+
+
+def should_use_macos_specific_budgets_for_app_bundle(tmp_path):
+    """macOS .app 不能套用 Windows onedir 的 800/160 阈值，否则健康 dmg 被误判失败。"""
+    report = pkg.verify_bundle(_healthy_macos_bundle(tmp_path), "macos")
+    assert report["ok"] is True
+    assert report["max_files"] == pkg.MAX_BUNDLE_FILES_MACOS
+    assert report["max_mb"] == pkg.MAX_BUNDLE_MB_MACOS
+    assert report["max_files"] > pkg.MAX_BUNDLE_FILES
+    assert report["max_mb"] > pkg.MAX_BUNDLE_MB
+
+
+def should_apply_windows_budgets_only_on_windows(tmp_path):
+    report = pkg.verify_bundle(_healthy_bundle(tmp_path), "windows")
+    assert report["max_files"] == pkg.MAX_BUNDLE_FILES
+    assert report["max_mb"] == pkg.MAX_BUNDLE_MB
+
+
+def should_fail_when_macos_bundle_exceeds_its_own_budget(tmp_path, monkeypatch):
+    """护栏按平台收紧后仍然生效：超过 macOS 自身阈值一样判失败。"""
+    monkeypatch.setattr(pkg, "MAX_BUNDLE_FILES_MACOS", 1)
+    report = pkg.verify_bundle(_healthy_macos_bundle(tmp_path), "macos")
+    assert report["ok"] is False and report["files"] == 2
+
+
+def should_not_double_count_framework_symlinks(tmp_path, monkeypatch):
+    """Qt framework 的 Versions/Current 等符号链接不与目标文件重复计数。
+
+    Windows 上 os.symlink 需要管理员权限，故用 monkeypatch 模拟「某个文件
+    是符号链接」，验证 verify_bundle 的 `not p.is_symlink()` 过滤确实生效。
+    """
+    bundle = _healthy_macos_bundle(tmp_path)
+    framework = bundle / "Contents" / "MacOS" / "QtCore.framework"
+    framework.mkdir(parents=True)
+    (framework / "QtCore").write_bytes(b"x" * 4096)
+    (framework / "Current").write_bytes(b"y" * 4096)   # 模拟 Versions/Current 链接
+
+    real_is_symlink = Path.is_symlink
+
+    def _fake_is_symlink(self):
+        return self.name == "Current" or real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", _fake_is_symlink)
+
+    report = pkg.verify_bundle(bundle, "macos")
+
+    assert report["ok"] is True
+    assert report["files"] == 3                        # exe + png + QtCore，链接不算
+    assert report["size_mb"] < 0.01                   # 体积没被链接翻倍
+
 
 
 def should_clean_stale_extracted_dirs_and_all_old_artifacts(tmp_path, monkeypatch):

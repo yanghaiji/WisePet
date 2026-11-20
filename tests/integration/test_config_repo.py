@@ -9,9 +9,13 @@ from WisePet.infra.config_repo import (
     JsonConfigRepository,
     CONFIG_FILE_NAME,
     DEFAULT_SYSTEM_PROMPT,
+    DATA_DIR_ENV,
     default_data_dir,
     mask_key,
     migrate_legacy_data,
+    migrate_data,
+    resolve_base_dir,
+    save_data_dir,
 )
 
 
@@ -87,6 +91,54 @@ class TestDataDir:
         """敏感配置绝不落在项目目录（规约例外项的唯一实现点）。"""
         assert default_data_dir() == Path.home() / ".WisePet"
         assert JsonConfigRepository().path == default_data_dir() / CONFIG_FILE_NAME
+
+
+class TestCustomDataDir:
+    def should_fallback_to_default_without_pointer(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv(DATA_DIR_ENV, raising=False)
+        assert resolve_base_dir() == tmp_path / ".WisePet"
+
+    def should_read_custom_path_from_pointer(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.delenv(DATA_DIR_ENV, raising=False)
+        custom = tmp_path / "mydata"
+        custom.mkdir()
+        assert save_data_dir(custom) is True
+        assert resolve_base_dir() == custom.resolve()
+
+    def should_env_override_pointer(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: home)
+        custom = tmp_path / "envdata"
+        custom.mkdir()
+        monkeypatch.setenv(DATA_DIR_ENV, str(custom))
+        assert resolve_base_dir() == custom
+        monkeypatch.delenv(DATA_DIR_ENV, raising=False)
+
+    def should_fallback_when_pointer_broken(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.delenv(DATA_DIR_ENV, raising=False)
+        (home / ".WisePet").mkdir()
+        (home / ".WisePet" / "location.json").write_text(
+            json.dumps({"path": str(tmp_path / "nonexistent")}), encoding="utf-8")
+        assert resolve_base_dir() == home / ".WisePet"
+
+    def should_migrate_data_to_new_location(self, tmp_path):
+        old = tmp_path / "old" / "sub"
+        old.mkdir(parents=True)
+        (old.parent / "config.json").write_text("{}", encoding="utf-8")
+        (old / "note.txt").write_text("hi", encoding="utf-8")
+        new = tmp_path / "new"
+        copied = migrate_data(old.parent, new)
+        assert {Path(p).as_posix() for p in copied} == {"config.json", "sub/note.txt"}
+        assert (new / "sub" / "note.txt").read_text(encoding="utf-8") == "hi"
+        assert (old.parent / "config.json").exists()        # 源保留作备份
 
 
 class TestLegacyDataMigration:

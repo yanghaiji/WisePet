@@ -187,3 +187,64 @@ class ConfirmDialog(QDialog):
                       geo.y() + (geo.height() - self.height()) // 3)
         self.show()
         self.raise_()
+
+
+class ChoiceDialog(QDialog):
+    """贴纸风三选一对话框（替代系统 QMessageBox 的位置授权等多选场景）。
+
+    choices: [(返回值, 按钮文案), ...]；`selected` 在点击后为对应返回值，
+    关闭/取消为 None。视觉与 InputDialog/ConfirmDialog 同一套贴纸风。
+    """
+
+    def __init__(self, title: str, text: str, choices: list[tuple[str, str]],
+                 *, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.selected: str | None = None
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.WindowType.Dialog
+                            | Qt.WindowType.WindowStaysOnTopHint
+                            | Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self.setFixedWidth(400)
+        self.setStyleSheet(_STYLE)
+
+        card = QFrame(self)
+        card.setObjectName("inputCard")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+
+        body = QVBoxLayout(card)
+        body.setContentsMargins(18, 16, 18, 14)
+        body.setSpacing(10)
+        title_label = QLabel(title, card)
+        title_label.setObjectName("inputTitle")
+        body.addWidget(title_label)
+        text_label = QLabel(text, card)
+        text_label.setObjectName("inputHint")
+        text_label.setWordWrap(True)
+        body.addWidget(text_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        for index, (value, label) in enumerate(choices):
+            btn = QPushButton(label, card)
+            # 第一个按钮作为主操作（橘色），其余为次操作（描边）
+            btn.setObjectName("inputOk" if index == 0 else "inputCancel")
+            btn.clicked.connect(lambda _checked=False, v=value: self._choose(v))
+            buttons.addWidget(btn)
+        body.addLayout(buttons)
+
+    def _choose(self, value: str) -> None:
+        self.selected = value
+        self.accept()
+
+    def show_centered(self) -> None:
+        from PySide6.QtGui import QGuiApplication
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            self.move(geo.x() + (geo.width() - self.width()) // 2,
+                      geo.y() + (geo.height() - self.height()) // 3)
+        self.show()
+        self.raise_()

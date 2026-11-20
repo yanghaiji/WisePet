@@ -16,6 +16,7 @@ from datetime import date, timedelta
 from typing import Callable
 
 from ..domain.chat_record import day_key
+from ..domain.metrics import ENGAGEMENT_EVENTS, engaged_days, guardrail_status
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +45,28 @@ def compute_metrics(data: dict, today: str) -> dict:
 
     feature = {name: count for name, count in sorted(totals.items())
                if name.startswith("cmd:") or name.startswith("feat:")}
-    return {
+    # 模型质量：失败占所有模型请求的比例（护栏「大脑可用」）
+    # 只算真正失败的请求；「lite 档不走工具」是正常路由，不在此列。
+    model_requests = totals.get("model:request", 0)
+    model_fails = totals.get("model:fail", 0)
+    fallback_rate = (round(model_fails / model_requests, 3)
+                     if model_requests else None)
+
+    # 距最近一次有效互动的天数（供「主动关怀」判断；从未互动记 None）
+    engaged_day_keys = [d for d, bucket in days.items()
+                        if bucket and any(n in ENGAGEMENT_EVENTS for n in bucket)]
+    try:
+        days_since = ((today_date - date.fromisoformat(max(engaged_day_keys))).days
+                      if engaged_day_keys else None)
+    except ValueError:
+        days_since = None
+
+    result = {
         "ttfv_chat": "first_chat_done" in firsts,
         "ttfv_reminder": "first_reminder_done" in firsts,
         "active_days": len(days),
+        "engaged_days": engaged_days(days),
+        "days_since_last_engagement": days_since,
         "d7_eligible": d7_eligible,
         "d7_retained": d7_eligible and d7_day in days,
         "reminder_shown": shown,
@@ -56,7 +75,12 @@ def compute_metrics(data: dict, today: str) -> dict:
         "crash_count": totals.get("app_crash", 0),
         "events_total": int(sum(totals.values())),
         "feature_reach": feature,
+        "model_request": model_requests,
+        "ai_fallback_rate": fallback_rate,
     }
+    # 护栏红黄绿灯：纯函数，供看板与命令面板展示
+    result["guardrails"] = guardrail_status(result)
+    return result
 
 
 class TelemetryService:

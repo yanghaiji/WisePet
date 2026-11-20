@@ -42,7 +42,7 @@ class FakeGateway:
         self.tool_calls: list[tuple] = []
         self.completes: list[tuple] = []
 
-    def stream_chat(self, messages, cfg):
+    def stream_chat(self, messages, cfg, on_reasoning=None):
         self.calls.append((messages, cfg))
         if self._error is not None:
             raise self._error
@@ -51,7 +51,7 @@ class FakeGateway:
         for chunk in self._chunks:
             yield chunk
 
-    def chat_with_tools(self, messages, cfg, tools):
+    def chat_with_tools(self, messages, cfg, tools, on_reasoning=None):
         self.tool_calls.append((messages, cfg, list(tools)))
         if self.tools_error is not None:
             raise self.tools_error

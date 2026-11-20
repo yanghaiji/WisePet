@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 AMAP_TIMEOUT_S = 10.0
 _BASE = "https://restapi.amap.com/v3/place/around"
+_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,40 @@ class AmapPoiGateway:
             return bool(str(self._key_provider() or "").strip())
         except Exception:  # noqa: BLE001 - 配置回调异常不影响主流程
             return False
+
+    def geocode(self, address: str, city: str = "") -> tuple[float, float] | None:
+        """把区域名/地址解析成 GCJ-02 坐标（经纬度）。
+
+        用途：系统精确定位不可用时，用用户说的「桂林路」「一汽35街区」等
+        区域名拿到街道级中心点，替代误差几公里的 IP 城市中心。失败返回 None。
+        """
+        key = str(self._key_provider() or "").strip()
+        address = str(address or "").strip()[:60]
+        if not key or not address:
+            return None
+        try:
+            resp = httpx.get(
+                _GEOCODE_URL,
+                params={"key": key, "address": address, "city": city[:30]},
+                timeout=AMAP_TIMEOUT_S,
+                headers={"User-Agent": "WisePet/1.0"})
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 - 地理编码失败静默回落
+            logger.info("amap geocode failed: %s", exc)
+            return None
+        data = resp.json()
+        if str(data.get("status") or "") != "1":
+            logger.info("amap geocode rejected: %s", data.get("info"))
+            return None
+        geocodes = data.get("geocodes") or []
+        if not geocodes:
+            return None
+        location = str(geocodes[0].get("location") or "")
+        try:
+            lon_s, lat_s = location.split(",", 1)
+            return float(lat_s), float(lon_s)
+        except (ValueError, TypeError):
+            return None
 
     def search_around(self, keyword: str, lat: float, lon: float,
                       radius_m: int = 3000) -> list[Poi]:

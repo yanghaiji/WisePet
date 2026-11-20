@@ -106,15 +106,20 @@ class ChatService:
         # 每次真正发出 AI 请求时计数（家庭场景防过度消费）
         self._ai_allowed = ai_allowed_provider
         self._on_ai_request = on_ai_request
-        self._queue: deque[str] = deque()
+        self._queue: deque = deque()
         self._cancelled = False
+        #: 当前正在处理消息的来源通道（input 输入条 / history 历史窗），
+        #: process_next 出队时设定，chunk 事件据此决定流式去气泡还是历史窗
+        self._channel = "input"
         #: 只为日志能把「一次请求」与「一条回复」串起来，不代表业务语义
         self._seq = 0
 
     # ---------- 命令 ----------
 
-    def send(self, text: str, attachments=()) -> bool:
+    def send(self, text: str, attachments=(), channel: str = "input") -> bool:
         """入队一条用户消息（可带附件）；空白消息且无附件被拒绝（不变量 C2）。
+
+        channel：input=单行输入条（回复走气泡）/ history=历史窗（回复走窗内流式）。
 
         同时发布「用户这一轮」与「开始思考」两个事实：聊天窗据此上屏与显示状态，
         按天仓储据此落盘。历史事件不复用流式 chunk，避免增量拼出半截记录。
@@ -128,11 +133,12 @@ class ChatService:
         self._session.add_turn("user", stripped or "[附件]")
         if self._summary_observer is not None and stripped:
             self._summary_observer("user", stripped)   # 摘要缓冲（v1.31）
-        self._queue.append((stripped, attachments))
+        self._queue.append((stripped, attachments, str(channel or "input")))
         ts = time.time()
         sid = day_key(ts)
         self._bus.publish(ChatTurnRecordedEvent(role="user", content=stripped,
-                                                source="user", ts=ts, session_id=sid))
+                                                source="user", ts=ts, session_id=sid,
+                                                channel=str(channel or "input")))
         self._bus.publish(ChatStateChangedEvent(phase=PHASE_THINKING,
                                                 source=self._brain_source(),
                                                 session_id=sid))
@@ -155,10 +161,18 @@ class ChatService:
         self._bus.publish(ChatStateChangedEvent(phase=phase, source=source,
                                                 detail=detail, session_id=day_key()))
 
-    def _publish_turn(self, role: str, content: str, source: str) -> None:
+    def _publish_reasoning(self, delta: str) -> None:
+        from ..domain.events import ChatReasoningEvent
+        self._bus.publish(ChatReasoningEvent(delta=delta, channel=self._channel))
+
+    def _publish_turn(self, role: str, content: str, source: str,
+                      images: tuple[str, ...] = (),
+                      videos: tuple[str, ...] = ()) -> None:
         ts = time.time()
         self._bus.publish(ChatTurnRecordedEvent(role=role, content=content, source=source,
-                                                ts=ts, session_id=day_key(ts)))
+                                                ts=ts, session_id=day_key(ts),
+                                                images=images, videos=videos,
+                                                channel=self._channel))
 
     # ---------- 消费（worker 线程调用） ----------
 
@@ -166,7 +180,9 @@ class ChatService:
         """处理队列头部一条消息；返回 False 表示队列已空。"""
         if not self._queue:
             return False
-        text, attachments = self._queue.popleft()
+        popped = self._queue.popleft()
+        text, attachments = popped[0], popped[1]
+        self._channel = popped[2] if len(popped) > 2 else "input"
         self._cancelled = False
         self._seq += 1
         seq = self._seq
@@ -203,7 +219,8 @@ class ChatService:
                 self._tool_runner, text, messages, seq, source, started):
             return True
         try:
-            for chunk in self._gateway.stream_chat(messages, cfg):
+            for chunk in self._gateway.stream_chat(
+                    messages, cfg, on_reasoning=self._publish_reasoning):
                 if self._cancelled:
                     logger.info("chat #%d source=ai cancelled by user", seq)
                     break
@@ -211,7 +228,8 @@ class ChatService:
                     first_wait = time.monotonic() - started
                     self._publish_phase(PHASE_REPLYING, source)
                 parts.append(chunk)
-                self._bus.publish(ChatReplyChunkEvent(text_delta=chunk))
+                self._bus.publish(ChatReplyChunkEvent(text_delta=chunk,
+                                                      channel=self._channel))
             reply = "".join(parts)
             pending = None
             if reply:
@@ -228,7 +246,8 @@ class ChatService:
                     self._summary_observer("assistant", reply)   # 摘要缓冲（v1.31）
             self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True,
                                                   reply=reply,
-                                                  pending_action=pending))
+                                                  pending_action=pending,
+                                                  channel=self._channel))
             self._publish_phase(PHASE_DONE, source)
             logger.info(
                 "chat #%d source=ai done chunks=%d reply_chars=%d first_chunk=%s "
@@ -239,19 +258,26 @@ class ChatService:
                 " cancelled=True" if self._cancelled else "", _preview(reply))
         except AIGatewayError as exc:
             logger.warning("chat #%d source=ai failed [%s]: %s", seq, exc.kind, exc.detail)
-            self._bus.publish(ChatErrorEvent(kind=exc.kind, detail=exc.detail))
-            self._on_failure(exc.kind, source)
+            self._bus.publish(ChatErrorEvent(kind=exc.kind, detail=exc.detail,
+                                             channel=self._channel))
+            self._on_failure(exc.kind, source, exc.detail)
         except Exception:  # noqa: BLE001 - 兜底未知异常，保证不崩（PRD NFR 可靠）
             logger.exception("chat #%d source=ai unexpected failure", seq)
             kind = AIGatewayError.SERVER
-            self._bus.publish(ChatErrorEvent(kind=kind, detail="unexpected"))
+            self._bus.publish(ChatErrorEvent(kind=kind, detail="unexpected",
+                                             channel=self._channel))
             self._on_failure(kind, source)
         return True
 
-    def _on_failure(self, kind: str, source: str) -> None:
-        """失败也要有终态：聊天窗显示错误类别，并把兜底话术记成一条助手回复。"""
-        self._publish_phase(PHASE_ERROR, source, detail=kind)
-        self._publish_turn("assistant", self.fallback_text(kind), "fallback")
+    def _on_failure(self, kind: str, source: str, detail: str = "") -> None:
+        """失败也要有终态：聊天窗显示错误原因，并把兜底话术记成一条助手回复。
+
+        detail 带上网关的原始错误（如「model not found」），用户不必翻日志
+        就知道是模型名错、Key 错还是 tools 不支持。
+        """
+        shown = detail or kind
+        self._publish_phase(PHASE_ERROR, source, detail=shown)
+        self._publish_turn("assistant", self.fallback_text(kind, detail), "fallback")
 
     def _try_agent(self, runner, text: str, messages: list[dict],
                    seq: int, source: str, started: float) -> bool:
@@ -270,19 +296,23 @@ class ChatService:
                 self._publish_phase(PHASE_REPLYING, source)
                 live["replying"] = True
             live["chars"] += len(delta)
-            self._bus.publish(ChatReplyChunkEvent(text_delta=delta))
+            self._bus.publish(ChatReplyChunkEvent(text_delta=delta,
+                                                  channel=self._channel))
 
         try:
-            outcome = runner(text, messages, on_content)
+            outcome = runner(text, messages, on_content,
+                             reasoning_callback=self._publish_reasoning)
         except AIGatewayError as exc:
             logger.warning("chat #%d agent failed [%s]: %s", seq, exc.kind, exc.detail)
-            self._bus.publish(ChatErrorEvent(kind=exc.kind, detail=exc.detail))
-            self._on_failure(exc.kind, source)
+            self._bus.publish(ChatErrorEvent(kind=exc.kind, detail=exc.detail,
+                                             channel=self._channel))
+            self._on_failure(exc.kind, source, exc.detail)
             return True
         except Exception:  # noqa: BLE001 - 兜底未知异常，保证不崩
             logger.exception("chat #%d agent unexpected failure", seq)
             self._bus.publish(ChatErrorEvent(kind=AIGatewayError.SERVER,
-                                             detail="unexpected"))
+                                             detail="unexpected",
+                                             channel=self._channel))
             self._on_failure(AIGatewayError.SERVER, source)
             return True
         if outcome is None:
@@ -295,14 +325,18 @@ class ChatService:
                 if self._cancelled:
                     logger.info("chat #%d agent cancelled by user", seq)
                     break
-                self._bus.publish(ChatReplyChunkEvent(text_delta=piece))
-        if reply:
+                self._bus.publish(ChatReplyChunkEvent(text_delta=piece,
+                                                      channel=self._channel))
+        if reply or outcome.images or outcome.videos:
             self._session.add_turn("assistant", reply)
-            self._publish_turn("assistant", reply, source)
+            self._publish_turn("assistant", reply, source, images=outcome.images,
+                               videos=outcome.videos)
             if self._summary_observer is not None:
                 self._summary_observer("assistant", reply)
-        self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True, reply=reply,
-                                              pending_action=outcome.pending_action))
+        self._bus.publish(ChatReplyChunkEvent(
+            text_delta="", done=True, reply=reply,
+            pending_action=outcome.pending_action, images=outcome.images,
+            videos=outcome.videos, channel=self._channel))
         self._publish_phase(PHASE_DONE, source)
         logger.info(
             "chat #%d agent done steps=%d tools=%s reply_chars=%d elapsed=%.2fs"
@@ -325,17 +359,19 @@ class ChatService:
         for index, piece in enumerate(stream_pieces(reply)):
             if index == 0:
                 self._publish_phase(PHASE_REPLYING, source)
-            self._bus.publish(ChatReplyChunkEvent(text_delta=piece))
+            self._bus.publish(ChatReplyChunkEvent(text_delta=piece,
+                                                  channel=self._channel))
         self._session.add_turn("assistant", reply)
         self._publish_turn("assistant", reply, source)
         if self._summary_observer is not None:
             self._summary_observer("assistant", reply)   # 摘要缓冲（v1.31）
-        self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True, reply=reply))
+        self._bus.publish(ChatReplyChunkEvent(text_delta="", done=True, reply=reply,
+                                              channel=self._channel))
         self._publish_phase(PHASE_DONE, source)
         logger.info("chat #%d source=local intent=%s reply_chars=%d elapsed=%.2fs preview=%s",
                     seq, self._local.last_intent, len(reply), time.monotonic() - started,
                     _preview(reply))
 
     @staticmethod
-    def fallback_text(kind: str) -> str:
+    def fallback_text(kind: str, detail: str = "") -> str:
         return FALLBACK_TEXTS.get(kind, UNKNOWN_FALLBACK)

@@ -91,6 +91,19 @@ class GeoLocator:
         self._cache: GeoInfo | None = None
         self._ip_city: str = ""          # 精确定位无城市名，用最近一次 IP 城市补
         self._precise_fail_ts: float = 0.0
+        self._last_diag: str = "尚未定位"  # 最近一次定位的来源说明（诊断命令用）
+
+    def last_diagnosis(self) -> str:
+        """一句话说明当前定位来源，供命令面板自查（不改定位行为）。"""
+        has_precise = self._precise_provider is not None
+        if self._cache is not None:
+            tag = "系统精确定位（百米级）" if self._cache.precise else "IP 城市级（城市中心，误差几公里）"
+            base = f"{tag}：{self._cache.text}"
+        else:
+            base = self._last_diag
+        if not has_precise:
+            base += "。系统精确定位未启用（QtPositioning 模块缺失或定位不可用）"
+        return base
 
     def locate(self) -> GeoInfo | None:
         now = time.monotonic()
@@ -98,6 +111,8 @@ class GeoLocator:
             ttl = (PRECISE_CACHE_TTL_S if self._cache.precise
                    else GEO_CACHE_TTL_S)
             if now - self._cache_ts < ttl:
+                self._last_diag = ("精确缓存" if self._cache.precise
+                                   else "IP 缓存") + f"：{self._cache.text}"
                 return self._cache
         if self._precise_provider is not None \
                 and now - self._precise_fail_ts > PRECISE_FAIL_BACKOFF_S:
@@ -116,12 +131,17 @@ class GeoLocator:
                                precise=True)
                 self._cache_ts = now
                 self._cache = info
+                self._last_diag = f"系统精确定位：{where}"
                 return info
+            self._last_diag = "系统精确定位失败/超时，已回落 IP 城市级"
         info = self._locate_via_ip()
         if info:
             self._ip_city = info.city or self._ip_city
             self._cache_ts = now
             self._cache = info
+            self._last_diag = f"IP 城市级：{info.text}"
+        else:
+            self._last_diag = "定位失败：IP 端点均不可用"
         return info
 
     def _safe_precise(self):

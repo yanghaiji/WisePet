@@ -157,7 +157,7 @@ def context_hint(ctx: BehaviorContext | None, is_night: bool) -> str | None:
 
 #: 明确的主动推送来源；`system` 不能整类算推送（工具执行反馈也用 system）
 PUSH_SOURCES: frozenset[str] = frozenset({
-    "reminder", "cheer", "news", "weekly", "growth", "focus",
+    "reminder", "cheer", "news", "weekly", "growth", "focus", "weather",
 })
 
 #: 少数服务用 source="system" 但确实是程序主动推送，靠标题兜住

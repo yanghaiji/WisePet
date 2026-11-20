@@ -15,6 +15,10 @@ QLabel#statsDot { color: #E8A45C; font-size: 16px; }
 QLabel#statValue { color: #E8A45C; font-size: 26px; font-weight: 700; }
 QLabel#statLabel { color: #9A7A55; font-size: 11px; }
 QLabel#statsGrowth { color: #6B4F3A; font-size: 13px; font-weight: 600; }
+QLabel#statsNorth { color: #5A3E28; font-size: 11px; }
+QLabel#lightOk { color: #4E8A5B; font-size: 11px; font-weight: 600; }
+QLabel#lightWarn { color: #C8652A; font-size: 11px; font-weight: 600; }
+QLabel#lightNa { color: #B09A7C; font-size: 11px; }
 QLabel#statsFoot { color: #B09A7C; font-size: 10px; }
 QPushButton#close {
     background: transparent; border: none; color: #A08A6C;
@@ -96,6 +100,25 @@ class StatsDialog(QWidget):
         growth_row.addWidget(self._growth)
         body.addWidget(growth_holder)
 
+        # 北极星 + 护栏红黄绿灯（第 1 件：让指标可消费）
+        from WisePet.domain.metrics import GUARDRAIL_LABELS
+        self._north = QLabel("有效互动 – 天", card)
+        self._north.setObjectName("statsNorth")
+        self._north.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body.addWidget(self._north)
+        self._lights: dict[str, QLabel] = {}
+        lights_holder = QWidget(card)
+        lights_row = QHBoxLayout(lights_holder)
+        lights_row.setContentsMargins(14, 2, 14, 2)
+        lights_row.setSpacing(6)
+        for key, label in GUARDRAIL_LABELS:
+            lamp = QLabel(f"{label} ●", card)
+            lamp.setObjectName("lightNa")
+            lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._lights[key] = lamp
+            lights_row.addWidget(lamp, 1)
+        body.addWidget(lights_holder)
+
         foot = QLabel("数据全部保存在本机 ~/.WisePet/，绝不上传", card)
         foot.setObjectName("statsFoot")
         foot.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -112,6 +135,22 @@ class StatsDialog(QWidget):
             self._growth.setText(f"成长：Lv{level}" + (f" · {stage}" if stage else ""))
         else:
             self._growth.setText("成长：–")
+
+    def set_product_metrics(self, metrics: dict) -> None:
+        """展示北极星（有效互动天数）与四个护栏灯。"""
+        from WisePet.domain.metrics import GUARDRAIL_LABELS
+        self._north.setText(f"有效互动 {int(metrics.get('engaged_days', 0))} 天 · 北极星")
+        lights = metrics.get("guardrails", {}) or {}
+        for key, label in GUARDRAIL_LABELS:
+            lamp = self._lights[key]
+            state = lights.get(key, "n/a")
+            mark = {"ok": "●", "warn": "▲", "n/a": "○"}.get(state, "○")
+            lamp.setText(f"{label} {mark}")
+            lamp.setObjectName({"ok": "lightOk", "warn": "lightWarn"}.get(
+                state, "lightNa"))
+            lamp.setStyleSheet("")   # 触发 objectName 变更后的样式刷新
+            lamp.style().unpolish(lamp)
+            lamp.style().polish(lamp)
 
     def show_centered(self) -> None:
         self.adjustSize()

@@ -173,13 +173,15 @@ AGENT.md                 Agent 开发规约、关键决策记录、验证方式
 - macOS 包默认**未签名未公证**：本机自用需 `codesign` 或右键→打开；分发时设置 `WISEPET_CODESIGN_IDENTITY` 让脚本签名，再自行走 Apple 公证流程。
 - 双平台一键出包：`.github/workflows/build.yml` 在 `windows-latest` 与 `macos-latest` 两个 runner 上并行调用本脚本，产物作为 artifacts 上传（push `v*` 标签或手动触发）。
 
-### 在 GitHub Actions 上出「签名 + 公证」的 Mac 包（你只配 secrets，不用自己有 Mac）
+### 在 GitHub Actions 上打 Mac 包（签名 / 公证能力暂缓启用）
 
-脚本本身已支持 macOS 打包 + 可选 codesign + notarize，**但 macOS 包必须在 macOS 上打**——
-这正是 GitHub Actions 的 `macos-latest` runner 能替你做的事。你只需要在自己仓库的
-`Settings → Secrets and variables → Actions` 里填好凭据，推送 `v*` 标签触发 CI，
-就会自动产出同时签名且公证过的 `WisePet-*-macos-*.dmg`（双击不再报「无法验证开发者」）。
-不配 secrets 则自动降级为未签名 dmg，不会报错。
+> **当前状态（用户要求「先不启用密钥」）**：CI **不注入任何 secrets、不导入证书**，
+> 双平台都走纯打包路径，产出**未签名** `WisePet-*-macos-*.dmg`（右键 → 打开可用）。
+> 签名/公证代码仍保留在 `tools/package.py`，以后有 Apple Developer 账号再按下表接回即可。
+
+`macOS` 包必须在 macOS 上打（PyInstaller 不支持交叉编译），这正是 GitHub Actions 的
+`macos-latest` runner 能替你做的事：推送 `v*` 标签触发 CI，Windows 与 macOS 各出一个包。
+下表是**将来重新启用签名/公证时**需要的凭据，当前 CI 未使用：
 
 | Secret | 用途 | 不填时 |
 |---|---|---|
@@ -195,10 +197,24 @@ AGENT.md                 Agent 开发规约、关键决策记录、验证方式
 > （这是 Apple 的硬性要求，CI 无法代替你申请）。拿到账号后，凭据只存在你仓库的 secrets 里，
 > 不会进入源码或日志；`package.py` 的公证步骤只在 `WISEPET_NOTARIZE=1` 且三项 Apple 凭据齐全时才调用 `xcrun`，否则静默跳过。
 >
-> 改 workflow 时注意：GitHub Actions 的 `if:` **不能引用 `secrets`**（会报
-> `Unrecognized named-value: 'secrets'` 导致整个 workflow 失效），所以「有没有证书」是在
-> shell 里用 `-z` 判断的；`if:` 只用了 `matrix.target`。另外 macOS runner 是 BSD `base64`，
-> 不支持 `--decode`，证书解码走 Python。这些约束由 `tests/unit/test_workflow_expressions.py` 静态护栏锁住。
+> **历史坑（重新启用时务必注意）**：GitHub Actions 的 `if:` **不能引用 `secrets`**
+> （报 `Unrecognized named-value: 'secrets'`，整个 workflow 失效）；证书存在性判断要放 shell，
+> `if:` 只用 `matrix.target`。另外 macOS runner 是 BSD `base64`，不支持 `--decode`，
+> 证书解码得走 Python。`tests/unit/test_workflow_expressions.py` 有静态护栏锁住这些约束，
+> 以及「当前 CI 不含任何 secrets 注入」这条临时决策。
+>
+> **macOS 产物自检阈值**：`.app` 是 Qt framework 目录树，文件数/体积天然数倍于 Windows
+> onedir，因此 `verify_bundle()` 按平台取阈值（macOS 4000 文件 / 600MB，Windows 800 / 160MB），
+> 并排除 framework 符号链接避免重复计数。打包失败时 CI 会打印 `dist/` 清单与自检结果。
+
+## 自动更新配置（可选）
+
+程序内置了自动更新检查，但**默认关闭**——要用需两步：
+
+1. **发布 Release**：把代码推到 GitHub，打一个 `v*` 标签（如 `v3.4.0`）。`.github/workflows/build.yml` 会自动出 Windows zip/setup.exe 与 macOS dmg 并发布到该 tag 的 Release（详见上文「打包」章节）。
+2. **在客户端配置**：设置 → 系统配置 → 勾选「启动时检查新版本」，「更新源」填你的仓库 `owner/repo`（如 `yourname/WisePet`），保存。也可点「立即检查更新」或命令面板搜「检查更新」。
+
+发现新版本时会提示；命令面板「安装更新」会下载对应平台的安装包并**打开它**——由你/系统完成安装（程序不会静默替换正在运行的文件），装完重启即可。未配置更新源或网络不通时安静跳过，不影响断网使用。
 
 ## 文档
 
@@ -218,8 +234,8 @@ AGENT.md                 Agent 开发规约、关键决策记录、验证方式
 - cat 的 10 个动作（60 帧）直接由 `docs/images/cat` 的 10 张 2×3 分镜图**等分切出**，保留原图全部画面（食盆、zzz、泪滴、张嘴、表情）；为满足素材契约只把白底抠成透明、擦掉 AI 水印、等比居中到 256×256 RGBA，6 帧共用一份包围盒保证不抖。dog / monkey 仍是旧素材
 - 小脑的**话题跟踪**（`last_topic`）重启即忘（PRD v1.2 §4 列为范围外），但按天落盘的聊天记录会回灌模型上下文，所以宠物仍记得之前聊过的话（FR v1.10 C16）；加载 jieba 后常驻内存约 +70MB，没装也能完整使用
 - 真机手工清单（12 项，含本地小脑八句口测、AI 链路三句与日志来源目检，见 AGENT.md §4）与 CPU/内存/24h 稳定性读数仍待人工采集
-- 首次引导只弹一次（标记 `~/.WisePet/onboarding.done`）；行为因果驱动用的是本机可观测的「时段 / 专注 / 勿扰」，**没有接天气或日程 API**；场景包是一次性配置预设，不会随日程自动切换
+- 首次引导只弹一次（标记 `~/.WisePet/onboarding.done`）；行为因果驱动用的是本机可观测的「时段 / 专注 / 勿扰」；**天气是可选联网增强**（设置→体验与隐私开启，国内免 Key 源），日程 API 未接；场景包是一次性配置预设，不会随日程自动切换
 - 写盘类操作只保留「最近一次」可撤销快照，进程重启后清空；覆盖写按原始字节还原，原文件读不出来时拒绝撤销
 - 聊天记录已迁 SQLite，**其余 10 类数据仍是 JSON**；迁移后不再产生按天文件，「删某天文件即删记录」的旧做法不再适用（要清空请删 `wisepet.db`）。旧文件只归档不删除，可随时重新导入
-- **本地埋点已落地**（只记事件名 + 按天计数，不上传、可清空、只保留近 30 天）；自动更新、macOS 代码签名与公证的证书/真机、AI 素材补图、天气/日历 API、助理任务队列与第三方 action 沙箱仍未做；皮肤工坊 / 插件 / STT / 手机伴侣属 P3，条件触发。见 `docs/产品规划.md` 与 `FR v1.25` §2
+- **本地埋点已落地**（只记事件名 + 按天计数，不上传、可清空、只保留近 30 天）；**自动更新已落地**（后台检查 GitHub Releases + 下载打开安装包，需配置 `owner/repo`，见下节）；天气能力已落地（聊天问答 + 可选定时播报）；macOS 代码签名与公证的证书/真机、AI 素材补图、日历 API、第三方 action 沙箱仍未做；皮肤工坊 / 插件 / STT / 手机伴侣属 P3，条件触发。见 `docs/产品规划.md`、`FR v1.25` §2 与 `FR v1.35`
 - 三套皮肤的**规格**已通过 `tools/verify_assets.py`（10 动作 × 6 帧 / 256×256 RGBA）；但 dog / monkey 仍是旧素材，画风与 cat 同批 AI 图尚未统一

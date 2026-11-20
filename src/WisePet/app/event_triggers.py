@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Callable
 
+from ..domain.care import care_term, context_score
 from ..domain.chat_record import day_key
 from ..domain.events import SpeakRequestedEvent
 
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 RULE_RETURN = "return_from_idle"
 RULE_LATE_NIGHT = "late_night"
 RULE_FOCUS_STREAK = "focus_streak"
+RULE_SOLAR_TERM = "solar_term_care"          # 节气关怀（本地近似，非联网 API）
+RULE_WEATHER = "weather_care"                # 天气关怀（可选联网，默认关闭）
 
 #: 人走开多久（秒）再回来，才值得打招呼
 AWAY_S = 1800.0
@@ -36,6 +39,11 @@ EVENT_TITLES = {
     RULE_LATE_NIGHT: "夜深了",
     RULE_FOCUS_STREAK: "今天很拼",
 }
+
+
+def solar_term_line(term: str) -> str:
+    """把节气名翻译成一句有人情味的关怀话术（纯函数）。"""
+    return f"今天是{term}，季节换了个脚步，记得照顾好自己呀～"
 
 
 def evaluate(*, hour: int, idle_s: float | None, prev_idle: float | None,
@@ -59,13 +67,22 @@ def evaluate(*, hour: int, idle_s: float | None, prev_idle: float | None,
 class EventTriggerService:
     def __init__(self, clock, bus, config_provider: Callable[[], object], store,
                  idle_provider: Callable[[], float | None],
-                 focus_count_provider: Callable[[], int]):
+                 focus_count_provider: Callable[[], int],
+                 *,
+                 term_provider: Callable[[float], str | None] | None = None,
+                 dismiss_rate_provider: Callable[[], float | None] | None = None,
+                 weather_line_provider: Callable[..., str] | None = None):
         self._clock = clock
         self._bus = bus
         self._config = config_provider
         self._store = store
         self._idle = idle_provider
         self._focus_count = focus_count_provider
+        # 节气关怀：默认按 tick 传入的时间取近似节气；可注入便于测试。
+        self._term = term_provider or care_term
+        self._dismiss_rate = dismiss_rate_provider
+        # 天气关怀：组装根注入 WeatherService.due_line（读缓存、零网络）
+        self._weather_line = weather_line_provider
         state = store.load()
         self._day = str(state.get("day") or "")
         self._fired: set[str] = set(state.get("fired") or [])
@@ -106,7 +123,38 @@ class EventTriggerService:
             self._bus.publish(SpeakRequestedEvent(
                 EVENT_LINES[rule], source="cheer", title=EVENT_TITLES[rule]))
             logger.info("event trigger fired: %s", rule)
-        if hits:
+        # 节气关怀：也是一条候选，和情境规则共用同一天的去重与总量上限，
+        # 并先过情境评分（专注/勿扰/深夜/高忽略率一律不打招呼）。
+        term = self._term(now)
+        remaining = int(cfg.event_daily_limit) - len(self._fired)
+        if (term and RULE_SOLAR_TERM not in self._fired and remaining > 0
+                and context_score(
+                    hour=time.localtime(now).tm_hour,
+                    dismiss_rate=(self._dismiss_rate() if self._dismiss_rate
+                                  else None)) > 0.0):
+            self._fired.add(RULE_SOLAR_TERM)
+            self._bus.publish(SpeakRequestedEvent(
+                solar_term_line(term), source="cheer", title=f"{term}到啦"))
+            logger.info("event trigger fired: solar_term=%s", term)
+        # 天气播报：用户配置的「每隔 N 分钟」提醒（像喝水/久坐），
+        # 独立于情境推送额度——不占 event_daily_limit，避免被「回来/深夜」挤掉。
+        # 周期去重由 WeatherService 内部做（按间隔），这里「有话才说」，
+        # 不塞进当日 fired 集合（否则一天只会报一次，与间隔语义冲突）。
+        # 仍过情境分（勿扰/深夜不打招呼）与统一 QuietBudget。
+        if self._weather_line is not None:
+            try:
+                w_line = self._weather_line(now, day_key_fn=day_key)
+            except Exception:  # noqa: BLE001 - 天气增强失败静默跳过
+                logger.debug("weather line failed", exc_info=True)
+                w_line = ""
+            if w_line and context_score(
+                    hour=time.localtime(now).tm_hour,
+                    dismiss_rate=(self._dismiss_rate() if self._dismiss_rate
+                                  else None)) > 0.0:
+                self._bus.publish(SpeakRequestedEvent(
+                    w_line, source="weather", title="今日天气"))
+                logger.info("event trigger fired: weather care")
+        if hits or RULE_SOLAR_TERM in self._fired:
             self._persist()
 
     def _persist(self) -> None:

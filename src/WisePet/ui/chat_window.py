@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Callable
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTextBrowser, QVBoxLayout, QWidget,
@@ -138,7 +138,46 @@ def _clock_of(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "--:--"
 
 
-def _bubble_html(record) -> str:
+#: 思考过程在气泡里最多显示多少字（思考可能很长，只给个概要）
+_REASONING_PREVIEW_CHARS = 160
+
+
+def _local_image_html(path: str, save_key: str = "") -> str:
+    """本机生成图片 → Qt 富文本：可点的缩略图 + 「保存」链接。
+
+    href 只放一个纯 ASCII 的 save_key（真实路径存在实例的字典里），彻底避开
+    Windows 路径里的冒号/反斜杠/中文被 QUrl 解析坏导致点击没反应的问题。
+    """
+    from pathlib import Path
+    p = Path(str(path or ""))
+    if not p.is_file():
+        return ""
+    url = p.resolve().as_uri()          # file:///...（Qt QTextDocument 支持）
+    save_url = f"wisepet-save:{save_key}"
+    return (f'<img src="{html.escape(url, quote=True)}" style="max-width:280px;" />'
+            f'<div style="margin-top:2px;">'
+            f'<a href="{save_url}" style="text-decoration:none;color:#8A6A45;'
+            f'background-color:#F8D79B;border:1px solid #E7C79A;'
+            f'padding:2px 8px;border-radius:6px;">保存图片</a>'
+            f'</div>')
+
+
+def _local_video_html(name: str, video_key: str) -> str:
+    """本机生成视频：文件名 + 播放/保存两个按钮（Qt 富文本不支持内嵌 video）。"""
+    label = html.escape(str(name or "生成的视频"))
+    play = f"wisepet-play:{video_key}"
+    save = f"wisepet-savevideo:{video_key}"
+    btn = ("text-decoration:none;color:#8A6A45;background-color:#F8D79B;"
+           "border:1px solid #E7C79A;padding:2px 8px;border-radius:6px;")
+    return (f'<div style="margin-top:4px;">🎬 {label}<br>'
+            f'<a href="{play}" style="{btn}">播放</a> '
+            f'<a href="{save}" style="{btn}">保存视频</a>'
+            f'</div>')
+
+
+def _bubble_html(record, image_keys: tuple[str, ...] = (),
+                 reasoning: str = "",
+                 video_keys: tuple[str, ...] = ()) -> str:
     """一条消息 = 一行小字元信息 + 一个带底色的气泡（Qt 富文本兼容写法）。
 
     助手消息完整渲染 markdown（标题/代码块/表格等，mistune 转义防注入）；
@@ -155,6 +194,26 @@ def _bubble_html(record) -> str:
         content = html.escape(record.content).replace("\n", "<br>")
     else:
         content = render_markdown(record.content)
+    # 推理模型的思考过程：浅色小字放在正文上方，与正式回复区分
+    if reasoning and not mine:
+        preview = html.escape(reasoning[:_REASONING_PREVIEW_CHARS])
+        if len(reasoning) > _REASONING_PREVIEW_CHARS:
+            preview += "…"
+        preview = preview.replace("\n", "<br>")
+        content = (f'<div style="color:#A08A6C;font-size:10px;'
+                   f'border-left:2px solid #DFC49A;padding-left:6px;margin-bottom:4px;">'
+                   f'💭 思考：{preview}</div>') + content
+    # agent 生成的本地图片：本应用产出、受信任，内联显示（与markdown里不加载远程图
+    # 的隐私口径不冲突——这些是本机的文件，不是网页远程资源）
+    images = tuple(getattr(record, "images", ()) or ())
+    img_html = "".join(_local_image_html(p, key) for p, key in zip(images, image_keys))
+    if img_html:
+        content = (content + "<br>" if content else "") + img_html
+    videos = tuple(getattr(record, "videos", ()) or ())
+    vid_html = "".join(_local_video_html(name, key)
+                       for name, key in zip(videos, video_keys))
+    if vid_html:
+        content = (content + "<br>" if content else "") + vid_html
     return (
         '<table width="100%" cellpadding="0" cellspacing="0" '
         'style="margin:5px 0 12px 0;">'
@@ -196,6 +255,17 @@ class ChatWindow(QWidget):
         self._detail = ""
         self._count = 0
         self._empty_hint = False
+        # 历史窗内流式回复：用「快照重建」代替脆弱的富文本块定位。
+        # 旧方案用 blockCount 定位流气泡，含图片/表格的富文本块数会漂移，一次重写
+        # 就把前面所有历史删掉（真机：点保存图片后 28 条全没）。快照方案每次
+        # 从已知完整的 base HTML 重建，绝不误删历史。
+        self._stream_base_html: str | None = None
+        self._stream_text = ""
+        self._stream_reasoning = ""    # 推理模型的思考过程（与正文分开显示）
+        # 图片另存：纯 ASCII 的 key → 本机图片路径（避免把 Windows 路径塞进 QUrl）
+        self._image_paths: dict[str, str] = {}
+        self._image_seq = 0
+        self._dialog_open = False           # 模态对话框期间屏蔽 Esc 关窗，防误关被当成"清空"
         self._drag_global: QPoint | None = None
         self._drag_window_pos: QPoint | None = None
         self._pinned = False               # 用户手动拖过之后不再被宠物位置拽回
@@ -291,6 +361,7 @@ class ChatWindow(QWidget):
         self._history = QTextBrowser(card)
         self._history.setReadOnly(True)
         self._history.setOpenExternalLinks(False)
+        self._history.anchorClicked.connect(self._on_anchor_clicked)
         self._edit = ChatTextEdit(card)
         self._edit.setObjectName("chatEdit")
         self._edit.setPlaceholderText("接着聊点什么…（回车发送，Shift+回车换行，可拖入文件）")
@@ -332,7 +403,8 @@ class ChatWindow(QWidget):
         body.addSpacing(8)
         body.addWidget(hint, 0, Qt.AlignCenter)
 
-        QShortcut(QKeySequence(Qt.Key_Escape), self, self.hide)
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self._esc_shortcut.activated.connect(self._on_escape)
         self._refresh_status()
         self._show_empty()
 
@@ -524,12 +596,74 @@ class ChatWindow(QWidget):
         if not self._count:
             self._show_empty()
 
+    def _register_images(self, record) -> tuple[str, ...]:
+        """给记录里的图片各分配一个 key 并登记路径，返回 key 元组供渲染。"""
+        images = tuple(getattr(record, "images", ()) or ())
+        keys = []
+        for path in images:
+            path_str = str(path)
+            # 同路径复用已有 key：流式每轮重写都会调这里，否则字典无界增长
+            existing = next((k for k, v in self._image_paths.items()
+                             if v == path_str), None)
+            if existing is None:
+                self._image_seq += 1
+                existing = f"i{self._image_seq}"
+                self._image_paths[existing] = path_str
+            keys.append(existing)
+        return tuple(keys)
+
+    def _register_videos(self, record) -> tuple[str, ...]:
+        """给记录里的视频分配 key 并登记路径（供播放/保存链接使用）。"""
+        videos = tuple(getattr(record, "videos", ()) or ())
+        keys = []
+        for path in videos:
+            path_str = str(path)
+            existing = next((k for k, v in self._image_paths.items()
+                             if v == path_str), None)
+            if existing is None:
+                self._image_seq += 1
+                existing = f"v{self._image_seq}"
+                self._image_paths[existing] = path_str
+            keys.append(existing)
+        return tuple(keys)
+
+    def _on_anchor_clicked(self, url) -> None:
+        """历史窗自定义链接：保存图片 / 播放视频 / 保存视频。"""
+        scheme = url.scheme()
+        if scheme not in ("wisepet-save", "wisepet-play", "wisepet-savevideo"):
+            return
+        key = url.toString().split(scheme + ":", 1)[-1]
+        path = self._image_paths.get(key, "")
+        if not path:
+            logger.info("%s: unknown key %s", scheme, key[:40])
+            return
+        if scheme == "wisepet-play":
+            from .video_io import play_video
+            if not play_video(path):
+                logger.info("play video failed: %s", path[:80])
+            return
+        self._dialog_open = True
+        self._esc_shortcut.setEnabled(False)   # QShortcut 不走 keyPressEvent，必须显式禁用
+        try:
+            if scheme == "wisepet-savevideo":
+                from .video_io import save_video_copy
+                saved = save_video_copy(path, self)
+            else:
+                from .image_io import save_image_copy
+                saved = save_image_copy(path, self, caption="保存生成的图片")
+        finally:
+            self._esc_shortcut.setEnabled(True)
+            self._dialog_open = False
+        if not saved:
+            logger.info("%s cancelled or failed: %s", scheme, path[:80])
+
     def append_record(self, record) -> None:
         """追加一条完整对话（不是流式增量）。"""
         if self._empty_hint:
             self._history.clear()
             self._empty_hint = False
-        self._history.append(_bubble_html(record))
+        self._history.append(_bubble_html(record, self._register_images(record),
+                                          video_keys=self._register_videos(record)))
         self._count += 1
         self._refresh_status()
 
@@ -542,6 +676,72 @@ class ChatWindow(QWidget):
             return                      # 搜索结果视图不被新消息冲掉
         if self.session_day == day_key():
             self.append_record(record)
+
+    # ---------- 窗内流式回复（历史窗直接聊时逐字上屏，不再弹桌面气泡） ----------
+
+    def begin_stream_reply(self) -> None:
+        """在历史区末尾插入一个「正在生成」的助手气泡，记住起始块供后续重写。"""
+        if self._searching:
+            return
+        if self._empty_hint:
+            self._history.clear()
+            self._empty_hint = False
+        # 快照当前完整历史；之后每轮从它重建，绝不删除既有消息
+        self._stream_base_html = self._history.toHtml()
+        self._stream_text = ""
+        self._stream_reasoning = ""
+        self._rewrite_stream_bubble()
+
+    def append_reasoning(self, delta: str) -> None:
+        """累加推理模型的思考增量，实时重绘气泡的思考区。"""
+        if self._stream_base_html is None or not delta:
+            return
+        self._stream_reasoning += delta
+        self._rewrite_stream_bubble()
+
+    def append_stream_piece(self, delta: str) -> None:
+        """累加一段流式文本并重绘气泡（节流由上层事件节奏决定）。"""
+        if self._stream_base_html is None or not delta:
+            return
+        self._stream_text += delta
+        self._rewrite_stream_bubble()
+
+    def end_stream_reply(self, full_text: str = "", images: tuple[str, ...] = (),
+                         videos: tuple[str, ...] = ()) -> None:
+        """流式收尾：用完整文本+图片/视频定稿气泡；done 后不再走 receive_record 重复追加。"""
+        if self._stream_base_html is None:
+            return
+        self._stream_text = full_text or self._stream_text
+        self._rewrite_stream_bubble(images=images, videos=videos)  # 定稿：思考区与正文一起呈现
+        self._stream_base_html = None
+        self._stream_text = ""
+        self._stream_reasoning = ""
+        self._count += 1
+        self._refresh_status()
+
+    def _rewrite_stream_bubble(self, images: tuple[str, ...] = (),
+                               videos: tuple[str, ...] = ()) -> None:
+        """从历史快照重建 + 末尾追加当前流气泡。
+
+        不用 QTextCursor 块定位：富文本（图片/表格）的块结构会让起始块号漂移，
+        一次重写就能删光前文（真机「点保存图片后 28 条全没」）。快照重建从已知
+        完整内容出发，无论重写多少次都绝不丢历史。
+        """
+        if self._stream_base_html is None:
+            return
+        from WisePet.domain.chat_record import ChatRecord
+        record = ChatRecord(role="assistant", content=self._stream_text or "思考中…",
+                            source="ai" if self._stream_text else "system",
+                            images=images, videos=videos)
+        self._history.setHtml(self._stream_base_html
+                              + _bubble_html(record, self._register_images(record),
+                                             reasoning=self._stream_reasoning,
+                                             video_keys=self._register_videos(record)))
+        self._history.moveCursor(QTextCursor.MoveOperation.End)
+
+    @property
+    def is_streaming_reply(self) -> bool:
+        return self._stream_base_html is not None
 
     def search(self, query: str) -> list:
         """跨日检索并渲染命中；空查询退出搜索态、回到所选日期。"""
@@ -621,7 +821,8 @@ class ChatWindow(QWidget):
 
     def _refresh_status(self) -> None:
         phase = _PHASE_TEXT.get(self._phase, self._phase)
-        if self._phase == PHASE_ERROR and self._detail:
+        # 错误类别 + 视频生成等异步进度都靠 detail 带，thinking 也要显示
+        if self._detail and self._phase in (PHASE_ERROR, PHASE_THINKING):
             phase = f"{phase}（{self._detail}）"
         brain = _BRAIN_TEXT.get(self._brain, self._brain)
         if self._searching:
@@ -648,8 +849,13 @@ class ChatWindow(QWidget):
         self._emit_active(False)
         super().hideEvent(event)
 
+    def _on_escape(self) -> None:
+        """Esc 关窗；另存对话框期间忽略，避免「取消保存=窗口消失=像清空了」。"""
+        if not self._dialog_open:
+            self.hide()
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 重写
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key_Escape and not self._dialog_open:
             self.hide()
             return
         super().keyPressEvent(event)

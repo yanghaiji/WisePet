@@ -43,12 +43,35 @@ class SummaryStore:
         data = load_json_or_backup_reset(self._path) or {}
         if not isinstance(data, dict):
             return {}
+        # v2：days={YYYY-MM-DD: 摘要}；兼容旧的单段 {day,text}
+        days = data.get("days")
+        if isinstance(days, dict) and days:
+            today = day_key()
+            text = str(days.get(today) or "")
+            if not text:                       # 今天没摘要就取最近一天
+                latest = sorted((str(k) for k in days), reverse=True)
+                text = str(days.get(latest[0]) or "") if latest else ""
+            return {"day": str(data.get("day") or ""), "text": text,
+                    "days": {str(k): str(v) for k, v in days.items()}}
         return {"day": str(data.get("day") or ""),
-                "text": str(data.get("text") or "")}
+                "text": str(data.get("text") or ""),
+                "days": {str(data.get("day")): str(data.get("text") or "")}
+                        if data.get("day") else {}}
 
-    def save(self, text: str) -> None:
+    def save(self, text: str, day: str | None = None) -> None:
+        """按天保存摘要（v2）；day 缺省为今天。旧字段一并写，兼容老版本读取。"""
+        day = str(day or day_key())
+        existing = load_json_or_backup_reset(self._path) or {}
+        days = {}
+        if isinstance(existing, dict) and isinstance(existing.get("days"), dict):
+            days = {str(k): str(v) for k, v in existing["days"].items()}
+        elif isinstance(existing, dict) and existing.get("text"):
+            days[str(existing.get("day") or day)] = str(existing["text"])
+        days[day] = text[:MAX_SUMMARY_CHARS]
+        # 只留最近 30 天，防止 summary.json 无限增长
+        days = dict(sorted(days.items(), key=lambda kv: kv[0], reverse=True)[:30])
         try:
-            atomic_write(self._path, {"day": day_key(), "text": text[:MAX_SUMMARY_CHARS]})
+            atomic_write(self._path, {"day": day, "text": days[day], "days": days})
         except OSError:
             logger.exception("summary save failed")
 
@@ -112,6 +135,12 @@ class SummaryMemory:
         if not self._enabled() or not self._summary:
             return None
         return f"\n早些时候的对话摘要（可能来自前几天，供你参考，不必复述）：{self._summary}"
+
+    def summary_for_day(self, day: str) -> str:
+        """按天取摘要（v2，供统一检索/回看某天时用）。"""
+        if not self._enabled():
+            return ""
+        return str(self._store.load().get("days", {}).get(str(day) or "") or "")
 
     def clear(self) -> None:
         with self._lock:

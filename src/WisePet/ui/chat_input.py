@@ -66,6 +66,11 @@ QPushButton#winbtn {
 }
 QPushButton#winbtn:hover { background: #F7EEDC; color: #7A5C3D; }
 QPushButton#winbtn:pressed { background: #EFE0C6; color: #5A3E28; }
+QPushButton#historyBtn {
+    background: #FFF6E8; border: 1px solid #E2CFAF; border-radius: 8px;
+    color: #8A6A45; font-size: 10px; padding: 2px 8px;
+}
+QPushButton#historyBtn:hover { background: #F3D9A8; color: #5A3E28; }
 QComboBox {
     background: #FFFFFF; border: 1px solid #E2CFAF; border-radius: 8px;
     padding: 1px 6px; color: #6B4F3A; font-size: 10px;
@@ -85,6 +90,8 @@ class ChatInput(QWidget):
     active_changed = Signal(bool)
     #: 用户在下拉里切了模型方案 → 主程序热切换 AI 配置
     model_selected = Signal(str)
+    #: 点「聊天记录」→ 主程序打开历史窗并收起输入条
+    history_requested = Signal()
 
     def __init__(self, screen_bounds: ScreenBounds | None = None,
                  parent: QWidget | None = None,
@@ -160,6 +167,11 @@ class ChatInput(QWidget):
             lambda name: self.model_selected.emit(name))
         model_label = QLabel("模型", card)
         model_label.setObjectName("status")
+        self._history_btn = QPushButton("聊天记录", card)
+        self._history_btn.setObjectName("historyBtn")
+        self._history_btn.setToolTip("打开完整聊天记录（会收起这个输入条）")
+        self._history_btn.setCursor(Qt.PointingHandCursor)
+        self._history_btn.clicked.connect(self.history_requested.emit)
         self._min_btn = QPushButton("—", card)
         self._min_btn.setObjectName("winbtn")
         self._min_btn.setToolTip("收起输入条（Esc 同效）")
@@ -179,6 +191,7 @@ class ChatInput(QWidget):
         status_row.addWidget(self._status, 1)
         status_row.addWidget(model_label, 0)
         status_row.addWidget(self._model_combo, 0)
+        status_row.addWidget(self._history_btn, 0)
         status_row.addWidget(self._min_btn, 0)
         status_row.addWidget(self._max_btn, 0)
         status_row.addWidget(self._close_btn, 0)
@@ -385,7 +398,9 @@ class ChatInput(QWidget):
 
     def _refresh_status(self) -> None:
         phase = _PHASE_TEXT.get(self._phase, self._phase)
-        if self._phase == "error" and self._detail:
+        # 错误类别、以及视频生成等异步任务的进度，都靠 detail 带上；
+        # 只在 error 显示会让「思考中 40%」这类进度被吞掉（真机反馈看不到进度）。
+        if self._detail and self._phase in ("error", "thinking"):
             phase = f"{phase}（{self._detail}）"
         brain = _BRAIN_TEXT.get(self._brain, self._brain)
         # 文案保持一行放得下（右侧还有「模型」标签 + 下拉），提示语进 tooltip

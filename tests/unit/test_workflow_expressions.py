@@ -97,3 +97,4 @@ def should_emit_diagnostics_when_packaging_fails():
     assert "if: failure()" in build
     assert "--verify" in build
     assert "ls -lah dist/" in build
+    assert "shell: bash" in build

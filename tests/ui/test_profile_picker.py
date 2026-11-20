@@ -73,6 +73,25 @@ class TestPicker:
         texts = [b.text() for b in dialog.findChildren(QPushButton)]
         assert any("沿用上次身份：小明" in t for t in texts)
 
+    def should_have_visible_close_button_that_rejects(self, qtbot, tmp_path):
+        """无边框弹窗要有可见关闭入口，点击等同 Esc（取消、维持现状）。"""
+        dialog = self._dialog(qtbot, tmp_path)
+        closes = [b for b in dialog.findChildren(QPushButton)
+                  if b.objectName() == "pickerClose"]
+        assert len(closes) == 1
+        close = closes[0]
+        assert close.text() == "×" and not close.isHidden()
+        assert "Esc" in close.toolTip()
+
+        close.click()                              # 等同 Esc：取消启动
+        assert dialog.result() == 0                # QDialog.Rejected
+        assert dialog.selected is None
+
+        # 卡片区重填（删除/重置后刷新）不该把标题行的关闭按钮一起清掉
+        dialog._build_cards()
+        assert any(b.objectName() == "pickerClose"
+                   for b in dialog.findChildren(QPushButton))
+
 
 # ---------- 启动身份选择（Esc 取消，不隐式落到管理员） ----------
 
@@ -165,7 +184,8 @@ def test_switch_profile_relaunches_new_process(qapp, tmp_path, monkeypatch):
     pet_app = main.PetApplication(
         qapp, config_repo=JsonConfigRepository(tmp_path / "default"),
         state_repo=PetStateRepository(tmp_path / "default"),
-        assets_dir=_ASSETS, clock=FakeClock(), tray_available=True)
+        assets_dir=_ASSETS, clock=FakeClock(), tray_available=True,
+        base_dir=tmp_path)
     try:
         # 气泡/TTS 链不真实触发：防止 hide_timer 在 shutdown 后跨测试污染
         monkeypatch.setattr(pet_app._controller, "speak",

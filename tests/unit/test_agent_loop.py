@@ -1,12 +1,13 @@
 """轴② agent 工具循环：function calling 多步 / 降级 / 步数上限 / 待确认动作。"""
 from __future__ import annotations
 
+import pathlib
 from dataclasses import replace
 
 import pytest
 from fakes import FakeClock, FakeGateway, make_collecting_bus
 
-from WisePet.app.agent_loop import AgentRunner, MAX_STEPS
+from WisePet.app.agent_loop import AgentRunner, MAX_STEPS, wants_image
 from WisePet.app.agent_tools import TOOL_SCHEMAS, AgentToolbox
 from WisePet.app.knowledge_base import KnowledgeBase
 from WisePet.app.task_service import TaskService
@@ -15,7 +16,7 @@ from WisePet.domain.chat_session import ChatSession
 from WisePet.domain.config_model import AppConfig
 from WisePet.domain.errors import AIGatewayError
 from WisePet.domain.events import ChatReplyChunkEvent
-from WisePet.domain.ports import AIConfig
+from WisePet.domain.ports import AIConfig, PURPOSE_IMAGE
 from WisePet.infra.knowledge_store import KnowledgeStore
 from WisePet.infra.task_store import TaskStore
 
@@ -57,6 +58,26 @@ def _toolbox(tmp_path):
                           TaskStore(tmp_path)),
         pet=None, config_provider=lambda: cfg,
         remind_callback=lambda action: None), folder, cfg
+
+
+def test_wants_image_covers_spoken_wording():
+    """真机漏词：用户说「画一个…证件照」必须识别成要画图。"""
+    for text in ("画一个可爱的小狗的证件照", "画一只猫", "画张图", "帮我画幅画",
+                 "生成一张图片", "也画一只小狗", "来张图", "再画个"):
+        assert wants_image(text), text
+    assert not wants_image("这张画好看吗")
+    assert not wants_image("今天天气不错")
+
+
+def test_wants_video_covers_spoken_wording():
+    """用户明确要视频的说法要识别出来（否则会回「我不会拍视频」）。"""
+    from WisePet.app.agent_loop import wants_video
+    for text in ("生成一段视频", "拍一段橘猫跳舞", "做个动画", "来段视频",
+                 "帮我生成一个视频", "生成一段猫跳舞的视频",
+                 "生成一个可爱的小猫跳舞的视频 10s左右的"):  # 真机原话
+        assert wants_video(text), text
+    assert not wants_video("今天天气不错")
+    assert not wants_video("这张画好看吗")
 
 
 def _ai_config():
@@ -156,6 +177,46 @@ class TestAgentLoop:
         assert outcome.tools_used == ["list_folder", "read_file"]
         assert outcome.steps == 3
 
+    def should_force_image_tool_on_keyword_when_model_skipped(self, tmp_path):
+        """模型只回「画好了」没调工具时，用户明确要图仍要补做一次（防幻觉）。"""
+        class _Img:
+            def generate_image(self, prompt, cfg, size="1024x1024"):
+                return b"PNGDATA", "image/png"
+
+        toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
+        toolbox._image_gateway = _Img()
+        toolbox._image_dir = tmp_path / "generated"
+        toolbox._image_cfg = lambda: AIConfig(api_key="k", purpose=PURPOSE_IMAGE)
+        gateway = FakeGateway(tools_results=[("画好啦！", [])])  # 模型没调工具
+        runner = AgentRunner(gateway, lambda: _ai_config(), lambda: "sys", toolbox,
+                             keyword_fallbacks=((("画一只", "画个"), "generate_image"),))
+        outcome = runner.run("画一只猫", [])
+
+        assert "generate_image" in outcome.tools_used
+        assert len(outcome.images) == 1           # 兜底真生成了图
+
+    def should_collect_generated_image_from_tool(self, tmp_path):
+        """画图工具产出：落盘 + 附到 outcome，供上层事件回传 UI。"""
+        from WisePet.domain.ports import PURPOSE_IMAGE, AIConfig as AC
+
+        class _Img:
+            def generate_image(self, prompt, cfg, size="1024x1024"):
+                assert prompt == "画一只猫"
+                return b"PNGDATA", "image/png"
+
+        toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
+        toolbox._image_gateway = _Img()
+        toolbox._image_dir = tmp_path / "generated"
+        toolbox._image_cfg = lambda: AC(api_key="k", purpose=PURPOSE_IMAGE)
+        gateway = FakeGateway(tools_results=[
+            ("", [_call("generate_image", prompt="画一只猫")]),
+            ("画好啦～", []),
+        ])
+        outcome = _runner(gateway, toolbox).run("画一只猫", [])
+        assert "画好" in outcome.final_text
+        assert outcome.images and len(outcome.images) == 1
+        assert (tmp_path / "generated" / pathlib.Path(outcome.images[0]).name).is_file()
+
     def should_yield_pending_action_for_create_file(self, tmp_path):
         toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
         gateway = FakeGateway(tools_results=[
@@ -227,7 +288,7 @@ def test_chat_service_uses_agent_and_emits_pending_action(tmp_path):
     gateway = FakeGateway(tools_results=[
         ("", [_call("create_file", path="D:/notes/todo.md", content="待办")])])
     service, collected = _chat(gateway, tmp_path,
-                               runner=lambda text, messages, on_content=None: _runner(
+                               runner=lambda text, messages, on_content=None, **_kw: _runner(
                                    gateway, toolbox).run(text, messages,
                                                          content_callback=on_content))
     service.send("帮我写个文件")
@@ -239,11 +300,104 @@ def test_chat_service_uses_agent_and_emits_pending_action(tmp_path):
     assert "确认" in done[0].reply or "准备" in done[0].reply
 
 
+def test_chat_service_emits_images_from_agent(tmp_path):
+    """画图产出的图片路径要随 done 事件到达主程序，才能展示给用户。"""
+    from WisePet.domain.ports import PURPOSE_IMAGE, AIConfig as AC
+
+    class _Img:
+        def generate_image(self, prompt, cfg, size="1024x1024"):
+            return b"PNGDATA", "image/png"
+
+    toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
+    toolbox._image_gateway = _Img()
+    toolbox._image_dir = tmp_path / "generated"
+    toolbox._image_cfg = lambda: AC(api_key="k", purpose=PURPOSE_IMAGE)
+    gateway = FakeGateway(tools_results=[
+        ("", [_call("generate_image", prompt="画只狗")]),
+        ("画好啦", []),
+    ])
+    service, collected = _chat(gateway, tmp_path,
+                               runner=lambda text, messages, on_content=None, **_kw: _runner(
+                                   gateway, toolbox).run(text, messages,
+                                                         content_callback=on_content))
+    service.send("画只狗")
+    service.process_next()
+
+    done = [e for e in collected if isinstance(e, ChatReplyChunkEvent) and e.done]
+    assert done and len(done[0].images) == 1
+    assert pathlib.Path(done[0].images[0]).is_file()
+
+
+def test_chat_service_emits_videos_from_agent(tmp_path):
+    """视频产出路径要随 done 事件到达主程序，才能在气泡/历史窗展示。"""
+    from WisePet.domain.ports import PURPOSE_VIDEO, AIConfig as AC
+
+    class _Vid:
+        def generate_video(self, prompt, cfg, progress=None):
+            if progress:
+                progress("生成中 50%")
+            return b"MP4DATA", "video/mp4"
+
+    toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
+    toolbox._video_gateway = _Vid()
+    toolbox._video_dir = tmp_path / "generated"
+    toolbox._video_cfg = lambda: AC(api_key="k", purpose=PURPOSE_VIDEO)
+    gateway = FakeGateway(tools_results=[
+        ("", [_call("generate_video", prompt="猫跳舞")]),
+        ("视频做好啦", []),
+    ])
+    service, collected = _chat(gateway, tmp_path,
+                               runner=lambda text, messages, on_content=None, **_kw: _runner(
+                                   gateway, toolbox).run(text, messages,
+                                                         content_callback=on_content))
+    service.send("生成一段猫跳舞的视频")
+    service.process_next()
+
+    done = [e for e in collected if isinstance(e, ChatReplyChunkEvent) and e.done]
+    assert done and len(done[0].videos) == 1
+    assert pathlib.Path(done[0].videos[0]).is_file()
+
+
+def test_video_task_emits_submitted_and_done(tmp_path):
+    """视频任务提交/完成要发事件，用户才有明确提醒（不再干等）。"""
+    from WisePet.domain.ports import PURPOSE_VIDEO, AIConfig as AC
+
+    class _Vid:
+        def generate_video(self, prompt, cfg, progress=None):
+            return b"MP4DATA", "video/mp4"
+
+    events = []
+
+    def sink(task_id, status, text, path):
+        events.append((task_id, status, text, path))
+
+    toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
+    toolbox._video_gateway = _Vid()
+    toolbox._video_dir = tmp_path / "generated"
+    toolbox._video_cfg = lambda: AC(api_key="k", purpose=PURPOSE_VIDEO)
+    toolbox._video_task = sink
+    gateway = FakeGateway(tools_results=[
+        ("", [_call("generate_video", prompt="猫跳舞")]),
+        ("视频做好啦", []),
+    ])
+    service, collected = _chat(gateway, tmp_path,
+                               runner=lambda text, messages, on_content=None, **_kw: _runner(
+                                   gateway, toolbox).run(text, messages,
+                                                         content_callback=on_content))
+    service.send("生成一段猫跳舞的视频")
+    service.process_next()
+
+    statuses = [e[1] for e in events]
+    assert "submitted" in statuses and "done" in statuses
+    done = next(e for e in events if e[1] == "done")
+    assert done[3] and pathlib.Path(done[3]).is_file()
+
+
 def test_chat_service_plain_path_still_works_when_runner_disabled(tmp_path):
     toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
     gateway = FakeGateway(chunks=["你好", "呀"])
     service, collected = _chat(gateway, tmp_path,
-                               runner=lambda text, m, on_content=None: None)
+                               runner=lambda text, m, on_content=None, **_kw: None)
     service.send("在吗")
     service.process_next()
 
@@ -255,7 +409,7 @@ def test_chat_service_agent_failure_reports_error(tmp_path):
     toolbox, _folder, _cfg_tool = _toolbox(tmp_path)
     gateway = FakeGateway(tools_error=AIGatewayError(AIGatewayError.TIMEOUT, "t"))
     service, collected = _chat(gateway, tmp_path,
-                               runner=lambda text, m, on_content=None: _runner(
+                               runner=lambda text, m, on_content=None, **_kw: _runner(
                                    gateway, toolbox).run(text, m,
                                                          content_callback=on_content))
     service.send("在吗")

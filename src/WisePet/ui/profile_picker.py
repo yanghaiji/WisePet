@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QFrame, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from .input_dialog import ConfirmDialog, InputDialog
@@ -26,6 +26,11 @@ QFrame#pickerCard {
 }
 QLabel#pickerTitle { color: #5A3E28; font-size: 18px; font-weight: 600; }
 QLabel#pickerHint { color: #9A7A55; font-size: 11px; }
+QPushButton#pickerClose {
+    background: transparent; border: none; border-radius: 8px;
+    color: #9A7A55; font-size: 19px;
+}
+QPushButton#pickerClose:hover { background: #F3E1C6; color: #5A3E28; }
 QPushButton#profileCard {
     background: #FFFFFF; border: 1px solid #EAD8B8; border-radius: 12px;
     color: #3A2B21; padding: 10px 14px; text-align: left; font-size: 13px;
@@ -143,10 +148,21 @@ class ProfilePickerDialog(QDialog):
         }
         hint = QLabel(hints[self._mode], card)
         hint.setObjectName("pickerHint")
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        close_btn = QPushButton("×", self)        # 无边框窗体：给个可见的关闭入口
+        close_btn.setObjectName("pickerClose")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setToolTip("关闭（也可以按 Esc）")
+        close_btn.clicked.connect(self.reject)    # 与 Esc 一致：取消，维持当前身份
+        title_row.addWidget(close_btn)
+
         head = QVBoxLayout()
-        head.setContentsMargins(18, 22, 18, 6)   # 无边框窗体：顶部多留白让标题呼吸
+        head.setContentsMargins(18, 14, 18, 6)   # 无边框窗体：顶部多留白让标题呼吸
         head.setSpacing(4)
-        head.addWidget(title)
+        head.addLayout(title_row)
         head.addWidget(hint)
 
         body = QVBoxLayout(card)

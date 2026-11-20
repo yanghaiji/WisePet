@@ -141,6 +141,9 @@ class PetController:
         self._bounce_left = 0
         # 聊天窗打开期间整只宠物原地待着，不自主溜达也不被提醒拽走
         self._conversation_active = False
+        # 正在等 AI/agent 回复：THINKING 期间不因一次性动作时长自动回 IDLE，
+        # 避免工具循环跑好几秒时宠物中途"发呆走开"（真机日志实证断档）
+        self._awaiting_reply = False
         # 柔和瞬移进行中（ui 淡出→落位→淡入）：期间冻结位移，防止动画被打架
         self._soft_jump_active = False
         self._last_jump_at: float | None = None
@@ -475,6 +478,8 @@ class PetController:
             return
         if now - self._state_since < duration:
             return
+        if state is BehaviorState.THINKING and self._awaiting_reply:
+            return                              # 还在等回复：保持思考态，不中途收场
         if state is BehaviorState.THINKING:
             # Pet.finish_action() 的集合里没有 THINKING（它本是等应答的会话态），
             # 但 THINKING→IDLE 在白名单里，直接迁移再统一发布一次状态变化。
@@ -623,12 +628,15 @@ class PetController:
         THINKING 是非法迁移（会被静默吞掉，宠物继续走），所以这里必须归一化。
         """
         if self._pet.state is BehaviorState.THINKING:
-            return  # 上一轮还在等回复，不重复迁移
+            self._awaiting_reply = True   # 已思考：重新声明仍在等回复（工具循环多轮）
+            return
         self._settle_to_idle_for_conversation(exclude=())
+        self._awaiting_reply = True
         self._try_transition(lambda: self._pet.start_thinking(), "THINKING")
 
     def start_speaking(self) -> None:
         """气泡开口：THINKING→SPEAKING 合法；从其它态也要能打断后开口。"""
+        self._awaiting_reply = False          # 回复就绪：结束思考保持
         if self._pet.state is BehaviorState.THINKING:
             self._try_transition(lambda: self._pet.start_speaking(), "SPEAKING")
             return
@@ -650,8 +658,23 @@ class PetController:
         if self._pet.state is not old:
             self._publish_state_change(old)
 
+    def end_thinking(self) -> None:
+        """结束「等回复」保持：失败/取消等不走 start_speaking 的路径兜底调用。
+
+        若此刻仍在 THINKING（如工具循环异常），放它按正常时长自然收场；
+        只是取消保持，让 _expire_one_shot 能照常工作。
+        """
+        self._awaiting_reply = False
+        # 若还卡在 THINKING（异常路径没走 start_speaking），立即放它回 IDLE，
+        # 不要把「思考中」一直挂在屏幕上。
+        if self._pet.state is BehaviorState.THINKING:
+            self._pet.transition(BehaviorState.IDLE)
+            self._publish_state_change(BehaviorState.THINKING)
+            self._reschedule_idle(self._clock.now(), self._config())
+
     def on_action_finished(self) -> None:
         """ui 动画播完/气泡关闭回调：一次性动作回待机。"""
+        self._awaiting_reply = False
         old = self._pet.state
         self._pet.finish_action()
         if old is not self._pet.state:

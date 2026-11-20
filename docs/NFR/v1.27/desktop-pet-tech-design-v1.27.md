@@ -12,7 +12,8 @@
 |---|---|
 | `tools/package.py` | 新增 `sign_dmg(dmg, dry_run)`（对 hdiutil 产物加 `--options runtime` 签名，否则公证必被拒）与 `notarize_dmg(dmg, dry_run)`；macOS 分支改为 `sign_app → dmg_installer → sign_dmg → notarize_dmg` |
 | `tools/package.py` | `notarize_dmg` 三重门控：`WISEPET_NOTARIZE == "1"` 才进、`APPLE_ID/APPLE_APP_PASSWORD/APPLE_TEAM_ID` 齐全才调 `xcrun`、`dry_run` 下只打印说明绝不回显明文密码；凭据全部走 `os.environ`，不落盘 |
-| `.github/workflows/build.yml` | 打包步骤注入 6 个 secrets（`WISEPET_CODESIGN_IDENTITY`/`WISEPET_NOTARIZE`/`APPLE_ID`/`APPLE_APP_PASSWORD`/`APPLE_TEAM_ID`）；新增「导入 macOS 证书」step（base64 解码 → 临时 keychain → `security import` → `set-key-partition-list`） |
+| `.github/workflows/build.yml` | 打包步骤注入 6 个 secrets（`WISEPET_CODESIGN_IDENTITY`/`WISEPET_NOTARIZE`/`APPLE_ID`/`APPLE_APP_PASSWORD`/`APPLE_TEAM_ID`）；新增「导入 macOS 证书」step（base64 解码 → 临时 keychain → `security import` → `set-key-partition-list`）。**后续按用户要求已摘除，见 §1b** |
+| `tests/unit/test_package_macos.py`（新，5 项） | 双重开关判定、凭据缺失降级、`sign_dmg` 身份门控；`run()` 用 monkeypatch 记录调用，不真正执行 `codesign/xcrun` |
 
 **CI 语法修复（用户真机推送时报错）**：证书 step 原写成
 `if: matrix.target == 'macos' && secrets.MACOS_CERTIFICATE != ''`，GitHub Actions 的 `if:`
@@ -24,11 +25,29 @@
 新增 `tests/unit/test_workflow_expressions.py`（7 项纯标准库静态护栏）：`if:` 不得出现
 `secrets.`、只允许合法 context 前缀、`${{ }}` 配对、step 缩进一致、证书 step 的 shell 兜底、
 禁用 `base64 --decode`。本机无 actionlint/PyYAML/Ruby，只能做静态校验，真 YAML 解析仍以 GitHub 为准。
-| `tests/unit/test_package_macos.py`（新，5 项） | 双重开关判定、凭据缺失降级、`sign_dmg` 身份门控；`run()` 用 monkeypatch 记录调用，不真正执行 `codesign/xcrun` |
 
 **降级语义**：任一凭据缺失即跳过对应步骤，产出未签名 dmg；CI 双平台矩阵不中断。
 本机 Windows 用 `python tools/package.py --target macos --dry-run` 验证命令拼接正确
 （未配身份时 codesign/notarize 命令均不出现）。
+
+### 1b CI 双平台打包失败修复（用户截图反馈，补登）
+
+用户推送后 `build (macos-latest, macos)` exit code 1、无 macos artifact。定位与落点：
+
+| 文件 | 改动 |
+|---|---|
+| `tools/package.py` | 新增 `MAX_BUNDLE_FILES_MACOS=4000` / `MAX_BUNDLE_MB_MACOS=600`；`verify_bundle()` 按 `target` 选阈值、`files` 过滤 `p.is_symlink()`（Qt framework 的 `Versions/Current` 链接会让 `stat()` 重复计体积）、`report` 带回 `max_files`/`max_mb`；`main()` 日志打印 `files=N/M` 与 `size=N/MMB`，失败信息带具体数值 |
+| `.github/workflows/build.yml` | 按用户「先不启用密钥」要求**摘除证书导入 step 与全部 6 个签名/公证 env 注入**，打包 step 只留 `PYTHONIOENCODING`；新增 `if: failure()` 诊断步骤打印 `dist/` 清单与 `--verify` 结果 |
+| `tests/integration/test_package.py` | 新增 4 项：macOS 专用阈值生效、Windows 阈值不受影响、超 macOS 自身阈值仍失败、framework 符号链接不重复计数 |
+| `tests/unit/test_workflow_expressions.py` | 两条证书 step 断言改为「CI 不含任何 secrets 注入」+「失败诊断步骤存在」 |
+
+**为何不是密钥逻辑**：未配 secrets 时 `sign_app`/`sign_dmg`/`notarize_dmg` 全部直接 return，
+证书 step `exit 0` 跳过；Windows job 成功也说明主干正常。真正根因是 `verify_bundle()` 拿
+Windows onedir 的 800/160 阈值卡 macOS `.app`，且它在 dmg 生成**之后**才跑 → 打包步骤
+`SystemExit(1)` → 上传步骤被跳过 → 无 macos artifact，与截图完全吻合。
+
+`tools/package.py` 的 `sign_app`/`sign_dmg`/`notarize_dmg` **保留不删**，将来有 Apple 账号时
+按 README 的 secrets 表把 env 与证书 step 接回即可，脚本无需改动。
 
 ## 2. C44 登场特效体系落点
 

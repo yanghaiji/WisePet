@@ -452,6 +452,26 @@ class TestConversationFreeze:
         assert ctx["pet"].position.y == 100
         assert ctx["controller"].is_moving() is False
 
+    def should_hold_thinking_while_awaiting_reply(self, ctx):
+        """agent 工具循环跑好几秒时，等回复期间 THINKING 不能被一次性时长收掉。"""
+        ctx["controller"].start_thinking()
+        ctx["clock"].advance(4.0)                 # 盖过 THINKING 的 3s 展示时长
+        ctx["controller"].tick_motion()
+        assert ctx["pet"].state is BehaviorState.THINKING
+
+        ctx["controller"].start_speaking()        # 回复就绪
+        ctx["clock"].advance(4.0)
+        ctx["controller"].tick_motion()
+        assert ctx["pet"].state is not BehaviorState.THINKING
+
+    def should_release_thinking_hold_on_end_thinking(self, ctx):
+        """失败/取消走 end_thinking 兜底，THINKING 恢复可自然收场。"""
+        ctx["controller"].start_thinking()
+        ctx["controller"].end_thinking()
+        ctx["clock"].advance(4.0)
+        ctx["controller"].tick_motion()
+        assert ctx["pet"].state is BehaviorState.IDLE
+
     def should_freeze_gravity_while_thinking_even_if_window_closed(self):
         ctx = make_ctx(position=PositionVO(500, 100))
         ctx["pet"].start_thinking()

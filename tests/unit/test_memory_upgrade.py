@@ -50,7 +50,7 @@ class _CompleteGateway:
             raise AssertionError("CompleteGateway.replies 已耗尽")
         return self.replies.pop(0)
 
-    def stream_chat(self, messages, cfg):   # pragma: no cover - 摘要不走流式
+    def stream_chat(self, messages, cfg, on_reasoning=None):   # pragma: no cover - 摘要不走流式
         yield ""
 
 
@@ -79,6 +79,17 @@ class TestSummaryMemory:
         assert gateway.calls                     # 后台线程已生成
         assert mem.prefix_line() and "周报" in mem.prefix_line()
         assert SummaryStore(tmp_path).load()["text"]
+
+    def should_store_summary_by_day(self, tmp_path):
+        """摘要按天存储，重启后能按日期取回（不再全局一段）。"""
+        store = SummaryStore(tmp_path)
+        store.save("周一在做周报", day="2026-11-16")
+        store.save("周二去健身", day="2026-11-17")
+        data = store.load()
+        assert data["days"]["2026-11-16"] == "周一在做周报"
+        assert data["days"]["2026-11-17"] == "周二去健身"
+        mem, _ = self._memory(tmp_path)
+        assert "健身" in mem.summary_for_day("2026-11-17")
 
     def should_silently_survive_ai_failure(self, tmp_path):
         gateway = _CompleteGateway(error=AIGatewayError(AIGatewayError.TIMEOUT, "t"))
@@ -130,6 +141,36 @@ class TestGeneralizedMemory:
         for i in range(60):
             mem.remember(f"事实{i}", "v")
         assert len(mem.entries()) == 50
+
+    def should_retrieve_only_relevant_facts_by_query(self, tmp_path):
+        """按当前问题挑相关事实，不把无关记忆全灌进提示词。"""
+        mem = self._memory(tmp_path)
+        mem.remember("养了只猫", "橘猫叫胖虎")
+        mem.remember("讨厌", "不吃香菜")
+        hits = mem.relevant("我家猫叫什么")
+        assert hits and hits[0]["key"] == "养了只猫"
+        assert "讨厌" not in {h["key"] for h in hits}
+        # prompt_line 带 query 时只注入相关事实
+        prompt = mem.prompt_line("我家猫叫什么")
+        assert "橘猫" in prompt and "香菜" not in prompt
+
+    def should_mark_source_and_supersede_on_overwrite(self, tmp_path):
+        """事实带来源（冲突时 user 优先），同 key 覆盖记录被替换者。"""
+        mem = self._memory(tmp_path)
+        mem.remember("养了只猫", "橘猫", source="ai", tags=("宠物",))
+        e = mem.entries()[0]
+        assert e["source"] == "ai" and "宠物" in e["tags"]
+        mem.remember("养了只猫", "英短", source="user")
+        e = mem.entries()[0]
+        assert e["source"] == "user" and e["superseded_by"] == "养了只猫"
+
+    def should_bump_access_count_on_retrieval(self, tmp_path):
+        """命中的事实刷新访问统计（越用越牢）。"""
+        mem = self._memory(tmp_path)
+        mem.remember("养了只猫", "橘猫叫胖虎")
+        before = mem.entries()[0]["access_count"]
+        mem.relevant("猫")
+        assert mem.entries()[0]["access_count"] > before
 
     def should_reject_blank_or_disabled(self, tmp_path):
         assert self._memory(tmp_path, enabled=False).remember("k", "v") is False

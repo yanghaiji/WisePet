@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 #: 任务种类
 WATCH_FILE = "watch_file"
 FOLLOWUP = "followup"
+WATCH_PAGE = "watch_page"   # 替你盯着网页（物流/成绩/开售），有动静告诉你
 
 #: 单次读取的文件上限（字节）：只读沙箱的硬边界
 MAX_FILE_BYTES = 512 * 1024
@@ -23,6 +24,11 @@ MIN_FOLLOWUP_S = 600.0
 _WATCH_RE = re.compile(
     r"(?:盯着|看着|监视|帮我盯)\s*(?P<path>[^\s，,]+)\s*"   # 允许 Windows 盘符冒号
     r"[，,]\s*(?:出现|有|包含|发现)\s*(?P<keyword>[^\s，,。！!]{1,30})")
+#: 网页盯梢：盯着 <url>，出现/变化 告诉 我
+_WATCH_PAGE_RE = re.compile(
+    r"(?:盯着|看着|监视|帮我盯)\s*(?P<url>https?://[^\s，,]+)\s*"
+    r"[，,]?\s*(?:(?:出现|有|包含|发现)\s*(?P<keyword>[^\s，,。！!]{1,30})"
+    r"|(?:有)?(?:变化|更新|动静))?")
 _FOLLOWUP_RE = re.compile(
     r"每隔\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>分钟|小时|min|h)\s*"
     r"(?:提醒|催)\s*(?:我)?(?P<goal>.{2,60})")
@@ -81,6 +87,21 @@ def parse_task_command(text: str, now: float = 0.0) -> TaskSpec | None:
     raw = str(text or "").strip()
     if not raw:
         return None
+    # 网页盯梢先判（URL 也满足文件盯梢的 path 模式，避免误判成盯文件）
+    page = _WATCH_PAGE_RE.search(raw)
+    if page is not None:
+        url = page.group("url").strip("'\"，,。")
+        keyword = (page.group("keyword") or "").strip("，,。！!告诉 我")
+        # 「有变化/更新/动静」属于变化监控，而非关键词命中
+        if keyword in {"变化", "更新", "动静", "有变化", "变动"}:
+            keyword = ""
+        meta = {"keyword": keyword, "watch": "keyword" if keyword else "change"}
+        return TaskSpec(
+            id=_make_id(raw, now), kind=WATCH_PAGE,
+            text=f"盯着网页，{'出现「'+keyword+'」' if keyword else '有变化'}就告诉你",
+            target=url, match=keyword, interval_s=300.0,
+            max_tries=0, created_at=now, next_at=now + 300.0,
+            meta=meta)
     watch = _WATCH_RE.search(raw)
     if watch is not None:
         path = watch.group("path").strip("'\"")
@@ -142,3 +163,32 @@ def is_safe_read_target(path: str, base_dir: str = "") -> bool:
     if not candidate or "\x00" in candidate:
         return False
     return not (candidate.startswith("-") or "://" in candidate)
+
+
+def is_safe_watch_url(url: str) -> bool:
+    """网页盯梢的静态白名单：只接受 http(s)，挡住内网/本地地址（SSRF 边界）。"""
+    candidate = str(url or "").strip().lower()
+    if not candidate.startswith(("http://", "https://")):
+        return False
+    # 去掉协议取主机名，挡住 localhost / 内网段 / 元数据地址
+    host = candidate.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "169.254.169.254"}:
+        return False
+    if host.startswith("192.168.") or host.startswith("10."):
+        return False
+    if host.startswith("172.") and 16 <= int(host.split(".")[1] or 0) <= 31:
+        return False
+    return bool(host) and "." in host
+
+
+def page_changed(previous: str, current: str, keyword: str = "") -> bool:
+    """网页盯梢的变化判定（纯函数）：有关键词看关键词出现，否则看内容变化。
+
+    previous 为空表示首次抓取——首抓不算「有动静」，先记基线。
+    """
+    cur = str(current or "")
+    if keyword:
+        return keyword in cur
+    if not previous:
+        return False
+    return str(previous) != cur

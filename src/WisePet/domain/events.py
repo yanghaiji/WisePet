@@ -38,12 +38,42 @@ class ChatReplyChunkEvent:
     # agent 工具循环产出的待确认动作（写盘/排期）；done=True 时可能携带，
     # 主线程据此走既有的三级权限 + 预览确认 + 审计链路
     pending_action: object | None = None
+    # agent 生成的本地图片路径（如画图工具产出）；done=True 时携带供 UI 展示
+    images: tuple[str, ...] = ()
+    # agent 生成的本地视频路径（如视频工具产出）；done=True 时携带
+    videos: tuple[str, ...] = ()
+    # 来源通道：input=单行输入条（走气泡）/ history=历史窗（走窗内流式，不弹气泡）
+    channel: str = "input"
+
+
+@dataclass(frozen=True)
+class ChatReasoningEvent:
+    """推理模型的思考过程增量（reasoning_content），与正文分开显示。"""
+    delta: str                       # 本段思考文字
+    done: bool = False               # True 表示思考结束（正文即将开始）
+    channel: str = "input"
 
 
 @dataclass(frozen=True)
 class ChatErrorEvent:
     kind: str  # AIGatewayError.KINDS 之一
     detail: str = ""
+    channel: str = "input"
+
+
+@dataclass(frozen=True)
+class MediaTaskEvent:
+    """异步媒体任务（视频生成）的进度事实：提交/进度/完成/失败。
+
+    视频要几分钟，普通聊天气泡不适合长期挂进度；用独立事件让主程序显示
+    一张任务气泡，完成后明确告诉用户文件名和位置。
+    """
+
+    task_id: str
+    kind: str = "video"          # video（未来可扩 image）
+    status: str = "submitted"    # submitted / progress / done / failed
+    text: str = ""               # 进度文案或错误说明
+    path: str = ""               # done 时的本地文件路径
 
 
 #: 会话阶段：一条用户消息从入队到回复结束的完整生命周期
@@ -73,6 +103,9 @@ class ChatTurnRecordedEvent:
     source: str = ""    # user / ai / local / fallback
     ts: float = 0.0
     session_id: str = ""
+    images: tuple[str, ...] = ()   # 本地生成图片路径，随记录持久化与回看
+    videos: tuple[str, ...] = ()   # 本地生成视频路径，随记录持久化与回看
+    channel: str = "input"         # input/history：history 的 assistant 已窗内流式，勿重复追加
 
 
 @dataclass(frozen=True)
@@ -112,3 +145,16 @@ class SpeakRequestedEvent:
     def __post_init__(self):
         if not str(self.text or "").strip():
             raise ValueError("speak text must not be blank")
+
+
+@dataclass(frozen=True)
+class UpdateCheckResultEvent:
+    """后台更新检查完成；info 为 infra.ReleaseInfo 或 None（领域层不 import infra）。"""
+    info: object = None
+    manual: bool = False
+
+
+@dataclass(frozen=True)
+class UpdateDownloadedEvent:
+    """后台更新包下载完成；path 为落盘路径，空串表示失败。"""
+    path: str = ""

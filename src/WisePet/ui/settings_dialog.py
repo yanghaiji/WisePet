@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from functools import lru_cache
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -47,9 +49,12 @@ from ..domain.config_model import (
     ReminderSettings,
     LocationSettings,
     WebSearchSettings,
+    WeatherSettings,
+    normalize_purpose,
     normalize_skin,
 )
 from ..domain.errors import AIGatewayError
+from ..domain.ports import PURPOSES
 from ..infra.config_repo import mask_key
 from ..infra.openai_client import probe
 from .screen_bounds import ScreenBounds
@@ -270,7 +275,9 @@ class SettingsDialog(QDialog):
                  parent: QWidget | None = None,
                  is_manager: bool = True,
                  profile_name: str = "",
-                 on_change_pin: Callable[[], None] | None = None):
+                 on_change_pin: Callable[[], None] | None = None,
+                 current_data_dir: str = "",
+                 on_data_dir_change: Callable[[str], str] | None = None):
         """`skin_options=None` 表示展示全部已定义皮肤；传入则只展示素材齐全的皮肤，
         但当前已选皮肤永远保留（避免静默把用户的选项改掉）。
         is_manager：当前是否管理员（默认身份）——家庭共享 AI 只有管理员可配。"""
@@ -281,6 +288,8 @@ class SettingsDialog(QDialog):
         self._is_manager = is_manager
         self._identity_name = profile_name
         self._on_change_pin = on_change_pin
+        self._current_data_dir = str(current_data_dir or "")
+        self._on_data_dir_change = on_data_dir_change
         self._skins = list(skin_options) if skin_options else list(PET_SKINS)
         if config.pet.skin not in self._skins:
             self._skins.append(normalize_skin(config.pet.skin))
@@ -338,6 +347,7 @@ class SettingsDialog(QDialog):
         body.addWidget(self._build_reminder_group(content))
         body.addWidget(self._build_companion_group(content))
         body.addWidget(self._build_experience_group(content))
+        body.addWidget(self._build_storage_group(content))
         body.addWidget(self._build_system_group(content))
         body.addStretch(1)
         self._scroll.setWidget(content)
@@ -466,6 +476,11 @@ class SettingsDialog(QDialog):
         self._profile_del.setParent(box)
         self._profile_name = QLineEdit(box)
         self._profile_name.setPlaceholderText("方案名（聊天窗下拉里显示）")
+        self._purpose_combo = _NoWheelComboBox(box)
+        self._purpose_combo.addItems(["chat · 对话", "image · 画图", "video · 视频"])
+        self._purpose_combo.setToolTip(
+            "这个方案用来做什么：chat 用于聊天，image 用于画图，video 用于生成视频。"
+            "说「画一张…」时会自动调用 image 方案。")
         self._base_url = QLineEdit(box)
         self._api_key = QLineEdit(box)
         self._api_key.setEchoMode(QLineEdit.Password)   # 不回显、不日志
@@ -476,6 +491,7 @@ class SettingsDialog(QDialog):
         self._timeout = _int_spin(_TIMEOUT_MIN_S, _TIMEOUT_MAX_S, 30, " s", box)
         form.addRow("模型方案", self._profile_combo)
         form.addRow("方案名", self._profile_name)
+        form.addRow("用途", self._purpose_combo)
         form.addRow("Base URL", self._base_url)
         form.addRow("API Key", self._api_key)
         form.addRow("Model", self._model)
@@ -511,11 +527,16 @@ class SettingsDialog(QDialog):
     # ---------- 模型方案编辑（列表在聊天窗下拉里切换） ----------
 
     def _on_profile_selected(self, _name: str) -> None:
-        """下拉换方案：先把表单里未保存的改动写回上一个方案，再载入新方案。"""
+        """下拉换方案：先把未保存改动写回旧方案，再载入新方案并设为生效方案。
+
+        设置窗这个下拉不只是「编辑谁」——选中的方案就是保存后 cfg.ai 生效的那份，
+        否则用户新加一个方案填好模型、选中保存，实际调用的还是旧模型。
+        """
         if not hasattr(self, "_profiles"):
             return
         self._flush_form_to_profile()
         selected = self._profile_combo.currentText()
+        self._active_profile_name = selected
         self._load_profile_fields(selected)
 
     def _load_profile_fields(self, name: str) -> None:
@@ -524,6 +545,8 @@ class SettingsDialog(QDialog):
             return
         self._form_profile_name = name
         self._profile_name.setText(profile.name)
+        purpose = normalize_purpose(getattr(profile, "purpose", ""))
+        self._purpose_combo.setCurrentIndex(PURPOSES.index(purpose))
         self._base_url.setText(profile.base_url)
         self._model.setText(profile.model)
         self._api_key.clear()                    # 敏感值不回填，与单方案时代同口径
@@ -540,13 +563,21 @@ class SettingsDialog(QDialog):
         for index, profile in enumerate(self._profiles):
             if profile.name != editing:
                 continue
+            purpose = PURPOSES[self._purpose_combo.currentIndex()] \
+                if 0 <= self._purpose_combo.currentIndex() < len(PURPOSES) \
+                else "chat"
             self._profiles[index] = replace(
                 profile, name=new_name,
                 base_url=self._base_url.text().strip() or profile.base_url,
                 api_key=self._api_key.text().strip() or profile.api_key,
-                model=self._model.text().strip() or profile.model)
+                model=self._model.text().strip() or profile.model,
+                embedding_model=self._embedding_model.text().strip()
+                or profile.embedding_model,
+                purpose=purpose)
             break
         self._form_profile_name = new_name
+        if getattr(self, "_active_profile_name", "") == editing:
+            self._active_profile_name = new_name
         # 同步下拉项文字（改了名的情况），不触发切换
         self._profile_combo.blockSignals(True)
         index = self._profile_combo.findText(editing)
@@ -588,8 +619,11 @@ class SettingsDialog(QDialog):
         self._system_prompt = QPlainTextEdit(box)
         self._system_prompt.setFixedHeight(90)
         self._system_prompt.setPlaceholderText("可用占位符：{name}、{vitals_summary}")
+        self._persona_anchor = QCheckBox("固定说话风格（换模型也不跑偏）", box)
+        self._persona_anchor.setToolTip("内置几段标准语气样例注入提示词，保持宠物性格稳定")
         form.addRow("名字", self._persona_name)
         form.addRow("System Prompt", self._system_prompt)
+        form.addRow("性格锚点", self._persona_anchor)
         return box
 
     def _build_pet_group(self, parent: QWidget) -> QFrame:
@@ -807,6 +841,10 @@ class SettingsDialog(QDialog):
                              ("总是允许（不再弹窗）", "granted"),
                              ("不允许（AI 拿不到位置）", "denied")):
             self._location_consent.addItem(label, value)
+        # 主动天气播报：默认关闭，开了才联网（国内天气源免 Key）
+        self._weather_enabled = QCheckBox("定时播报天气（联网取，免 Key）", box)
+        self._weather_interval = _int_spin(30, 1440, 180, " 分钟", box)
+        self._weather_bad_alert = QCheckBox("雨雪天额外提醒一次", box)
         form.addRow("助理能力", self._assistant_enabled)
         form.addRow("可托付", self._tasks_enabled)
         form.addRow("盯文件间隔", self._task_poll)
@@ -824,7 +862,41 @@ class SettingsDialog(QDialog):
         form.addRow("高德 Key", self._amap_key)
         form.addRow("位置权限", self._location_enabled)
         form.addRow("授权策略", self._location_consent)
+        form.addRow("天气播报", self._weather_enabled)
+        form.addRow("播报间隔", self._weather_interval)
+        form.addRow("坏天气提醒", self._weather_bad_alert)
         return box
+
+    def _build_storage_group(self, parent: QWidget) -> QFrame:
+        """数据存储位置：显示当前路径、可选新目录、浏览按钮。改位置需迁移+重启。"""
+        browse = QPushButton("浏览…", parent)
+        browse.setObjectName("inputOk")
+        browse.setToolTip("选一个已存在的文件夹存放 WisePet 的全部数据")
+        browse.clicked.connect(self._on_browse_data_dir)
+        box, form = self._section(parent, "数据存储位置", actions=[browse])
+        current = QLabel(self._current_data_dir or "（未检测）", box)
+        current.setObjectName("sectionNote")
+        current.setWordWrap(True)
+        self._data_dir_current = current
+        self._data_dir_edit = QLineEdit(box)
+        self._data_dir_edit.setPlaceholderText(
+            "留空=用当前位置；填绝对路径可换位置（保存后需重启，数据会复制过去）")
+        form.addRow("当前位置", current)
+        form.addRow("改为", self._data_dir_edit)
+        note = QLabel(
+            "所有记忆、聊天记录（数据库）、配置都在这里；换位置会把旧数据复制过去，"
+            "原目录保留作备份。家庭共享 Key 也随新位置走。", box)
+        note.setWordWrap(True)
+        note.setObjectName("sectionNote")
+        form.addRow("", note)
+        return box
+
+    def _on_browse_data_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "选择数据存储位置", self._data_dir_edit.text().strip()
+            or self._current_data_dir or str(Path.home()))
+        if chosen:
+            self._data_dir_edit.setText(chosen)
 
     def _build_system_group(self, parent: QWidget) -> QFrame:
         """系统配置：与宠物本身无关的运行参数（当前是日志治理四项）。"""
@@ -844,12 +916,31 @@ class SettingsDialog(QDialog):
         form.addRow("单文件上限", self._log_max_mb)
         form.addRow("保留天数", self._log_retention)
         form.addRow("日志分档", self._log_split)
+        # 自动更新：可选，默认关；检查按钮由组装根接回调（见 set_update_callback）
+        self._auto_check_update = QCheckBox("启动时检查新版本（后台，不打扰）", box)
+        self._update_repo = QLineEdit(box)
+        self._update_repo.setPlaceholderText("GitHub 仓库，如 owner/repo（留空不检查）")
+        self._check_update_btn = QPushButton("立即检查更新", box)
+        self._check_update_btn.setObjectName("inputOk")
+        self._check_update_btn.clicked.connect(self._on_check_update_clicked)
+        self._update_callback = None
+        form.addRow("自动更新", self._auto_check_update)
+        form.addRow("更新源", self._update_repo)
+        form.addRow("", self._check_update_btn)
         note = QLabel("保存后立即生效，无需重启；设置放在 ~/.WisePet/config.json 的 system 分节。",
                       box)
         note.setWordWrap(True)
         note.setObjectName("sectionNote")
         form.addRow("", note)
         return box
+
+    def set_update_callback(self, callback) -> None:
+        """组装根注入「立即检查更新」回调（接收当前输入的 repo 字符串）。"""
+        self._update_callback = callback
+
+    def _on_check_update_clicked(self) -> None:
+        if self._update_callback is not None:
+            self._update_callback(self._update_repo.text().strip())
 
     # ---------- 取值 / 回填 ----------
 
@@ -872,6 +963,8 @@ class SettingsDialog(QDialog):
             if self._is_manager else False)
         self._persona_name.setText(cfg.persona.name)
         self._system_prompt.setPlainText(cfg.persona.system_prompt)
+        self._persona_anchor.setChecked(
+            bool(getattr(cfg.persona, "anchor_enabled", True)))
         self._walk_speed.setValue(cfg.pet.walk_speed_px_per_s)
         self._idle_min.setValue(int(cfg.pet.idle_min_s))
         self._idle_max.setValue(int(cfg.pet.idle_max_s))
@@ -985,6 +1078,18 @@ class SettingsDialog(QDialog):
             getattr(location, "consent", "ask") if location is not None else "ask")
         if consent_index >= 0:
             self._location_consent.setCurrentIndex(consent_index)
+        weather = getattr(cfg, "weather", None)
+        self._weather_enabled.setChecked(
+            weather.enabled if weather is not None else False)
+        # 兼容旧固定时刻配置：有 report_hour 时换算成「每 24 小时一次」
+        old_hour = getattr(weather, "report_hour", None) if weather is not None else None
+        interval = (1440 if old_hour is not None
+                    else int(getattr(weather, "interval_min", 180)
+                             if weather is not None else 180))
+        self._weather_interval.setValue(interval)
+        self._weather_bad_alert.setChecked(
+            bool(getattr(weather, "bad_weather_alert", True)
+                 if weather is not None else True))
         quiet = getattr(cfg, "quiet", None)
         self._quiet_enabled.setChecked(quiet.enabled if quiet is not None else True)
         self._quiet_daily.setValue(int(quiet.daily_limit) if quiet is not None else 12)
@@ -1024,6 +1129,10 @@ class SettingsDialog(QDialog):
             int(system.log_retention_days) if system is not None else 3)
         self._log_split.setChecked(
             system.log_split_by_level if system is not None else True)
+        self._auto_check_update.setChecked(
+            bool(system.auto_check_update) if system is not None else False)
+        self._update_repo.setText(
+            str(getattr(system, "update_repo", "") or "") if system is not None else "")
         self._sync_reminder_labels()
 
     def _sync_reminder_labels(self) -> None:
@@ -1048,6 +1157,7 @@ class SettingsDialog(QDialog):
                      api_key=active.api_key,
                      model=active.model,
                      embedding_model=self._embedding_model.text().strip(),
+                     purpose=normalize_purpose(getattr(active, "purpose", "")),
                      temperature=float(self._temperature.value()),
                      timeout_s=float(self._timeout.value()))
         # 管理员专属：共享状态持久化在 assistant 分节（文件落盘由组装根处理）
@@ -1056,7 +1166,8 @@ class SettingsDialog(QDialog):
         persona = PersonaConfig(name=self._persona_name.text().strip()
                                 or self._base.persona.name,
                                 system_prompt=self._system_prompt.toPlainText().strip()
-                                or self._base.persona.system_prompt)
+                                or self._base.persona.system_prompt,
+                                anchor_enabled=self._persona_anchor.isChecked())
         # 用 replace 而不是重建 PetParams：v2.0 的位移/概率参数不在表单上，
         # 重建会把它们全部静默打回默认值（贴地开关也就永远关不掉）。
         pet = replace(self._base.pet,
@@ -1127,7 +1238,11 @@ class SettingsDialog(QDialog):
                          log_level=self._log_level.currentData() or "info",
                          log_max_mb=int(self._log_max_mb.value()),
                          log_retention_days=int(self._log_retention.value()),
-                         log_split_by_level=self._log_split.isChecked())
+                         log_split_by_level=self._log_split.isChecked(),
+                         auto_check_update=self._auto_check_update.isChecked(),
+                         update_repo=self._update_repo.text().strip()[:100],
+                         data_dir=self._data_dir_edit.text().strip()[:500]
+                         or self._base.system.data_dir)
         companion = replace(self._base.companion,
                             enabled=self._companion_enabled.isChecked(),
                             recall_enabled=self._recall_enabled.isChecked(),
@@ -1159,6 +1274,10 @@ class SettingsDialog(QDialog):
         location = LocationSettings(
             enabled=self._location_enabled.isChecked(),
             consent=self._location_consent.currentData() or "ask")
+        weather = WeatherSettings(
+            enabled=self._weather_enabled.isChecked(),
+            interval_min=float(self._weather_interval.value()),
+            bad_weather_alert=self._weather_bad_alert.isChecked())
         return AppConfig(ai=ai, ai_profiles=profiles, persona=persona, pet=pet,
                          vitals=self._base.vitals, reminders=reminders,
                          news=news, cheer=cheer, bubble=bubble, chat=chat,
@@ -1167,13 +1286,16 @@ class SettingsDialog(QDialog):
                          behavior=behavior, memory=memory, actions=actions,
                          system=system, companion=companion,
                          assistant=assistant, web_search=web_search,
-                         location=location), ""
+                         location=location, weather=weather), ""
 
     def _match_active_profile(self, cfg: AppConfig) -> str:
-        """当前生效 ai 对应的方案名；找不到就用第一个方案。"""
+        """当前生效 ai 对应的方案名；找不到就用第一个方案。
+
+        只按 base_url + model 匹配：家庭共享会替换 api_key，比 key 必然对不上。
+        """
         for profile in self._profiles:
-            if (profile.base_url == cfg.ai.base_url and profile.model == cfg.ai.model
-                    and profile.api_key == cfg.ai.api_key):
+            if (profile.base_url == cfg.ai.base_url
+                    and profile.model == cfg.ai.model):
                 return profile.name
         return self._profiles[0].name
 
@@ -1183,6 +1305,17 @@ class SettingsDialog(QDialog):
         cfg, error = self.collect()
         if cfg is None:
             self._show_status(error, ok=False)
+            return
+        # 数据目录变更：走专门回调（迁移+写指针+提示重启），不走普通热保存
+        target = self._data_dir_edit.text().strip()
+        if target and target != self._current_data_dir:
+            if self._on_data_dir_change is None:
+                self._show_status("当前不支持修改数据目录", ok=False)
+                return
+            result = self._on_data_dir_change(target)
+            self._show_status(result, ok="失败" not in result and "取消" not in result)
+            if "失败" not in result and "取消" not in result:
+                self.accept()
             return
         if self._on_saved is not None:
             try:
@@ -1204,7 +1337,7 @@ class SettingsDialog(QDialog):
         try:
             probe(cfg.ai)
         except AIGatewayError as exc:
-            self._show_status(f"连接失败：{ChatService.fallback_text(exc.kind)}"
+            self._show_status(f"连接失败：{ChatService.fallback_text(exc.kind, exc.detail)}"
                               f"（{exc.detail}）", ok=False)
             return
         self._show_status("连接成功 ✓", ok=True)
